@@ -1,5 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc};
 
+use bdk_wallet::bip39::Mnemonic;
 use bitcoin::{
     absolute::Height,
     hashes::{hmac, ripemd160, sha256, sha512, Hash, HashEngine},
@@ -11,13 +12,14 @@ use futures::{
     StreamExt as _,
 };
 use miette::IntoDiagnostic as _;
+use thiserror::Error;
 use tonic::{Request, Response, Status};
 
 use crate::{
     convert,
-    messages::CoinbaseMessage,
+    messages::{CoinbaseMessage, M1ProposeSidechain, M2AckSidechain, M3ProposeBundle},
     proto::{
-        common::{ConsensusHex, ReverseHex},
+        common::{ConsensusHex, Hex, ReverseHex},
         crypto::{
             crypto_service_server::CryptoService, HmacSha512Request, HmacSha512Response,
             Ripemd160Request, Ripemd160Response, Secp256k1SecretKeyToPublicKeyRequest,
@@ -32,26 +34,35 @@ use crate::{
             BroadcastWithdrawalBundleResponse, CreateBmmCriticalDataTransactionRequest,
             CreateBmmCriticalDataTransactionResponse, CreateDepositTransactionRequest,
             CreateDepositTransactionResponse, CreateNewAddressRequest, CreateNewAddressResponse,
-            CreateSidechainProposalRequest, CreateSidechainProposalResponse, GenerateBlocksRequest,
-            GenerateBlocksResponse, GetBlockHeaderInfoRequest, GetBlockHeaderInfoResponse,
+            CreateSidechainProposalRequest, CreateSidechainProposalResponse, CreateWalletRequest,
+            CreateWalletResponse, GenerateBlocksRequest, GenerateBlocksResponse, GetBalanceRequest,
+            GetBalanceResponse, GetBlockHeaderInfoRequest, GetBlockHeaderInfoResponse,
             GetBlockInfoRequest, GetBlockInfoResponse, GetBmmHStarCommitmentRequest,
             GetBmmHStarCommitmentResponse, GetChainInfoRequest, GetChainInfoResponse,
             GetChainTipRequest, GetChainTipResponse, GetCoinbasePsbtRequest,
             GetCoinbasePsbtResponse, GetCtipRequest, GetCtipResponse, GetSidechainProposalsRequest,
             GetSidechainProposalsResponse, GetSidechainsRequest, GetSidechainsResponse,
-            GetTwoWayPegDataRequest, GetTwoWayPegDataResponse, Network, SubscribeEventsRequest,
-            SubscribeEventsResponse,
+            GetTwoWayPegDataRequest, GetTwoWayPegDataResponse, ListTransactionsRequest,
+            ListTransactionsResponse, Network, SendTransactionRequest, SendTransactionResponse,
+            SubscribeEventsRequest, SubscribeEventsResponse, UnlockWalletRequest,
+            UnlockWalletResponse, WalletTransaction,
         },
     },
-    types::{Event, SidechainNumber},
+    types::{BlindedM6, Event, SidechainNumber},
     validator::Validator,
+    wallet::error::WalletInitialization,
 };
 
-fn invalid_field_value<Message>(field_name: &str, value: &str) -> tonic::Status
+fn invalid_field_value<Message, Error>(
+    field_name: &str,
+    value: &str,
+    source: Error,
+) -> tonic::Status
 where
     Message: prost::Name,
+    Error: std::error::Error + Send + Sync + 'static,
 {
-    let err = crate::proto::Error::invalid_field_value::<Message>(field_name, value);
+    let err = crate::proto::Error::invalid_field_value::<Message, _>(field_name, value, source);
     tonic::Status::invalid_argument(err.to_string())
 }
 
@@ -86,8 +97,28 @@ impl IntoStatus for miette::Report {
             return source.clone().into();
         }
 
+        if let Some(source) = self.downcast_ref::<crate::wallet::error::WalletInitialization>() {
+            let code = match source {
+                crate::wallet::error::WalletInitialization::InvalidPassword => {
+                    tonic::Code::InvalidArgument
+                }
+                crate::wallet::error::WalletInitialization::NotUnlocked => {
+                    tonic::Code::FailedPrecondition
+                }
+                crate::wallet::error::WalletInitialization::DataMismatch => tonic::Code::Internal,
+                crate::wallet::error::WalletInitialization::NotFound => tonic::Code::NotFound,
+                crate::wallet::error::WalletInitialization::AlreadyExists => {
+                    tonic::Code::AlreadyExists
+                }
+                crate::wallet::error::WalletInitialization::AlreadyUnlocked => {
+                    tonic::Code::AlreadyExists
+                }
+            };
+            return tonic::Status::new(code, format!("{self:#}"));
+        }
+
         tracing::warn!("Unable to convert miette::Report to a meaningful tonic::Status: {self:?}");
-        tonic::Status::new(tonic::Code::Unknown, self.to_string())
+        tonic::Status::new(tonic::Code::Unknown, format!("{self:#}"))
     }
 }
 
@@ -125,8 +156,12 @@ impl ValidatorService for Validator {
             let raw_id =
                 sidechain_id.ok_or_else(|| missing_field::<GetBlockInfoRequest>("sidechain_id"))?;
 
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<GetBlockInfoRequest>("sidechain_id", &raw_id.to_string())
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<GetBlockInfoRequest, _>(
+                    "sidechain_id",
+                    &raw_id.to_string(),
+                    err,
+                )
             })?
         };
 
@@ -138,7 +173,7 @@ impl ValidatorService for Validator {
             .map_err(|err| tonic::Status::from_error(Box::new(err)))?;
         let resp = GetBlockInfoResponse {
             header_info: Some(header_info.into()),
-            block_info: Some(block_info.into_proto(sidechain_id)),
+            block_info: Some(block_info.as_proto(sidechain_id)),
         };
         Ok(tonic::Response::new(resp))
     }
@@ -159,10 +194,11 @@ impl ValidatorService for Validator {
             let raw_id = sidechain_id
                 .ok_or_else(|| missing_field::<GetBmmHStarCommitmentRequest>("sidechain_id"))?;
 
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<GetBmmHStarCommitmentRequest>(
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<GetBmmHStarCommitmentRequest, _>(
                     "sidechain_id",
                     &raw_id.to_string(),
+                    err,
                 )
             })?
         };
@@ -206,8 +242,13 @@ impl ValidatorService for Validator {
         request: tonic::Request<GetChainTipRequest>,
     ) -> Result<tonic::Response<GetChainTipResponse>, tonic::Status> {
         let GetChainTipRequest {} = request.into_inner();
-        let tip_hash = self.get_mainchain_tip().map_err(|err| err.into_status())?;
-
+        let Some(tip_hash) = self
+            .try_get_mainchain_tip()
+            .into_diagnostic()
+            .map_err(|err| err.into_status())?
+        else {
+            return Err(tonic::Status::unavailable("Validator is not synced"));
+        };
         let header_info = self
             .get_header_info(&tip_hash)
             .map_err(|err| tonic::Status::from_error(err.into()))?;
@@ -224,22 +265,22 @@ impl ValidatorService for Validator {
         let request = request.into_inner();
         let mut messages = Vec::<CoinbaseMessage>::new();
         for propose_sidechain in request.propose_sidechains {
-            let message = propose_sidechain
+            let m1: M1ProposeSidechain = propose_sidechain
                 .try_into()
                 .map_err(|err: crate::proto::Error| err.into_status())?;
-            messages.push(message);
+            messages.push(m1.into());
         }
         for ack_sidechain in request.ack_sidechains {
-            let message = ack_sidechain
+            let m2: M2AckSidechain = ack_sidechain
                 .try_into()
                 .map_err(|err: crate::proto::Error| err.into_status())?;
-            messages.push(message);
+            messages.push(m2.into());
         }
         for propose_bundle in request.propose_bundles {
-            let message = propose_bundle
+            let m3: M3ProposeBundle = propose_bundle
                 .try_into()
                 .map_err(|err: crate::proto::Error| err.into_status())?;
-            messages.push(message);
+            messages.push(m3.into());
         }
         let ack_bundles = request
             .ack_bundles
@@ -281,8 +322,12 @@ impl ValidatorService for Validator {
             let raw_id = sidechain_number
                 .ok_or_else(|| missing_field::<GetCtipRequest>("sidechain_number"))?;
 
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<GetCtipRequest>("sidechain_number", &raw_id.to_string())
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<GetCtipRequest, _>(
+                    "sidechain_number",
+                    &raw_id.to_string(),
+                    err,
+                )
             })?
         };
 
@@ -336,16 +381,28 @@ impl ValidatorService for Validator {
         request: tonic::Request<GetSidechainProposalsRequest>,
     ) -> Result<tonic::Response<GetSidechainProposalsResponse>, tonic::Status> {
         let GetSidechainProposalsRequest {} = request.into_inner();
-        let mainchain_tip = self.get_mainchain_tip().map_err(|err| err.into_status())?;
+        let Some(mainchain_tip) = self
+            .try_get_mainchain_tip()
+            .into_diagnostic()
+            .map_err(|err| err.into_status())?
+        else {
+            let response = GetSidechainProposalsResponse {
+                sidechain_proposals: Vec::new(),
+            };
+            return Ok(Response::new(response));
+        };
         let mainchain_tip_height = self
             .get_header_info(&mainchain_tip)
             .into_diagnostic()
             .map_err(|err| err.into_status())?
             .height;
-        let sidechain_proposals = self.get_sidechains().map_err(|err| err.into_status())?;
+        let sidechain_proposals = self
+            .get_sidechains()
+            .into_diagnostic()
+            .map_err(|err| err.into_status())?;
         let sidechain_proposals = sidechain_proposals
             .into_iter()
-            .map(|(description_sha256d_hash, sidechain)| {
+            .map(|(proposal_id, sidechain)| {
                 let description = ConsensusHex::encode(&sidechain.proposal.description.0);
                 let declaration =
                     crate::types::SidechainDeclaration::try_from(&sidechain.proposal.description)
@@ -355,7 +412,9 @@ impl ValidatorService for Validator {
                     sidechain_number: Some(sidechain.proposal.sidechain_number.0 as u32),
                     description: Some(description),
                     declaration,
-                    description_sha256d_hash: Some(ReverseHex::encode(&description_sha256d_hash)),
+                    description_sha256d_hash: Some(ReverseHex::encode(
+                        &proposal_id.description_hash,
+                    )),
                     vote_count: Some(sidechain.status.vote_count as u32),
                     proposal_height: Some(sidechain.status.proposal_height),
                     proposal_age: Some(mainchain_tip_height - sidechain.status.proposal_height),
@@ -375,6 +434,7 @@ impl ValidatorService for Validator {
         let GetSidechainsRequest {} = request.into_inner();
         let sidechains = self
             .get_active_sidechains()
+            .into_diagnostic()
             .map_err(|err| err.into_status())?;
         let sidechains = sidechains.into_iter().map(SidechainInfo::from).collect();
         let response = GetSidechainsResponse { sidechains };
@@ -395,8 +455,12 @@ impl ValidatorService for Validator {
             let raw_id = sidechain_id
                 .ok_or_else(|| missing_field::<GetTwoWayPegDataRequest>("sidechain_id"))?;
 
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<GetTwoWayPegDataRequest>("sidechain_id", &raw_id.to_string())
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<GetTwoWayPegDataRequest, _>(
+                    "sidechain_id",
+                    &raw_id.to_string(),
+                    err,
+                )
             })?
         };
 
@@ -444,8 +508,12 @@ impl ValidatorService for Validator {
             let raw_id = sidechain_id
                 .ok_or_else(|| missing_field::<SubscribeEventsRequest>("sidechain_id"))?;
 
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<SubscribeEventsRequest>("sidechain_id", &raw_id.to_string())
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<SubscribeEventsRequest, _>(
+                    "sidechain_id",
+                    &raw_id.to_string(),
+                    err,
+                )
             })?
         };
 
@@ -522,17 +590,15 @@ fn stream_proposal_confirmations(
         block_info: crate::types::BlockInfo,
     ) -> CreateSidechainProposalResponse {
         let (confirms, outpoint) = {
-            if let Some(vout) =
-                block_info
-                    .sidechain_proposals
-                    .into_iter()
-                    .find_map(|(vout, proposal)| {
-                        if proposal == *sidechain_proposal {
-                            Some(vout)
-                        } else {
-                            None
-                        }
-                    })
+            if let Some(vout) = block_info
+                .sidechain_proposals()
+                .find_map(|(vout, proposal)| {
+                    if *proposal == *sidechain_proposal {
+                        Some(vout)
+                    } else {
+                        None
+                    }
+                })
             {
                 let outpoint = bitcoin::OutPoint {
                     txid: block_info.coinbase_txid,
@@ -557,7 +623,7 @@ fn stream_proposal_confirmations(
             block_hash: Some(ReverseHex::encode(&header_info.block_hash)),
             confirmations: Some(confirms),
             height: Some(header_info.height),
-            outpoint: Some((*outpoint).into()),
+            outpoint: Some((&*outpoint).into()),
             prev_block_hash: Some(ReverseHex::encode(&header_info.prev_block_hash)),
         };
         confirmations.insert(header_info.block_hash, (confirms, outpoint));
@@ -590,9 +656,11 @@ fn stream_proposal_confirmations(
 }
 
 #[tonic::async_trait]
-impl WalletService for Arc<crate::wallet::Wallet> {
+impl WalletService for crate::wallet::Wallet {
     type CreateSidechainProposalStream =
         BoxStream<'static, Result<CreateSidechainProposalResponse, tonic::Status>>;
+
+    type GenerateBlocksStream = BoxStream<'static, Result<GenerateBlocksResponse, tonic::Status>>;
 
     async fn create_sidechain_proposal(
         &self,
@@ -605,10 +673,11 @@ impl WalletService for Arc<crate::wallet::Wallet> {
         let sidechain_id = {
             let raw_id = sidechain_id
                 .ok_or_else(|| missing_field::<CreateSidechainProposalRequest>("sidechain_id"))?;
-            SidechainNumber::try_from(raw_id).map_err(|_| {
-                invalid_field_value::<CreateSidechainProposalRequest>(
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<CreateSidechainProposalRequest, _>(
                     "sidechain_id",
                     &raw_id.to_string(),
+                    err,
                 )
             })?
         };
@@ -649,9 +718,7 @@ impl WalletService for Arc<crate::wallet::Wallet> {
         &self,
         _request: tonic::Request<CreateNewAddressRequest>,
     ) -> std::result::Result<tonic::Response<CreateNewAddressResponse>, tonic::Status> {
-        let wallet = self as &Arc<crate::wallet::Wallet>;
-
-        let address = wallet.get_new_address().map_err(|err| err.into_status())?;
+        let address = self.get_new_address().map_err(|err| err.into_status())?;
 
         let response = CreateNewAddressResponse {
             address: address.to_string(),
@@ -662,36 +729,81 @@ impl WalletService for Arc<crate::wallet::Wallet> {
     async fn generate_blocks(
         &self,
         request: tonic::Request<GenerateBlocksRequest>,
-    ) -> std::result::Result<tonic::Response<GenerateBlocksResponse>, tonic::Status> {
-        // If we're not on regtest, this won't work!
-        if self.validator().network() != bitcoin::Network::Regtest {
-            return Err(tonic::Status::failed_precondition(
-                "can only generate blocks on regtest",
-            ));
-        }
+    ) -> std::result::Result<tonic::Response<Self::GenerateBlocksStream>, tonic::Status> {
+        let GenerateBlocksRequest {
+            blocks,
+            ack_all_proposals,
+        } = request.into_inner();
+        let count = blocks.unwrap_or(1);
 
-        // FIXME: Remove `optional` from the `blocks` parameter in the proto file.
-        let count = request.into_inner().blocks.unwrap_or(1);
+        self.verify_can_mine(count).await?;
 
-        // TODO: take this in from the protobuf request, once https://github.com/LayerTwo-Labs/cusf_sidechain_proto/pull/21
-        // is merged.
-        let ack_all_proposals = true;
-        self.generate(count, ack_all_proposals)
-            .await
-            .map_err(|err| err.into_status())?;
-        let response = GenerateBlocksResponse {};
-        Ok(tonic::Response::new(response))
+        tracing::info!("generate blocks: verified ability to mine");
+
+        let stream = crate::wallet::Wallet::generate_blocks(self.clone(), count, ack_all_proposals)
+            .map(|stream_item| match stream_item {
+                Ok(block_hash) => Ok(GenerateBlocksResponse {
+                    block_hash: Some(ReverseHex::encode(&block_hash)),
+                }),
+                Err(err) => {
+                    tracing::error!("{err:#}");
+                    Err(err.into_status())
+                }
+            })
+            .boxed();
+        Ok(tonic::Response::new(stream))
     }
 
     async fn broadcast_withdrawal_bundle(
         &self,
-        _request: tonic::Request<BroadcastWithdrawalBundleRequest>,
+        request: tonic::Request<BroadcastWithdrawalBundleRequest>,
     ) -> std::result::Result<tonic::Response<BroadcastWithdrawalBundleResponse>, tonic::Status>
     {
-        Err(tonic::Status::new(
-            tonic::Code::Unimplemented,
-            "not implemented",
-        ))
+        let BroadcastWithdrawalBundleRequest {
+            sidechain_id,
+            transaction,
+        } = request.into_inner();
+        let sidechain_id = {
+            let raw_id = sidechain_id
+                .ok_or_else(|| missing_field::<BroadcastWithdrawalBundleRequest>("sidechain_id"))?;
+            SidechainNumber::try_from(raw_id).map_err(|err| {
+                invalid_field_value::<BroadcastWithdrawalBundleRequest, _>(
+                    "sidechain_id",
+                    &raw_id.to_string(),
+                    err,
+                )
+            })?
+        };
+        let transaction_bytes = transaction
+            .ok_or_else(|| missing_field::<BroadcastWithdrawalBundleRequest>("transaction"))?;
+        let transaction: Transaction = bitcoin::consensus::deserialize(&transaction_bytes)
+            .map_err(|err| {
+                invalid_field_value::<BroadcastWithdrawalBundleRequest, _>(
+                    "transaction",
+                    &hex::encode(&transaction_bytes),
+                    err,
+                )
+            })?;
+        let transaction: BlindedM6 =
+            Cow::<Transaction>::Owned(transaction)
+                .try_into()
+                .map_err(|err| {
+                    invalid_field_value::<BroadcastWithdrawalBundleRequest, _>(
+                        "transaction",
+                        &hex::encode(transaction_bytes),
+                        err,
+                    )
+                })?;
+        let _m6id = self
+            .put_withdrawal_bundle(sidechain_id, &transaction)
+            .map_err(|err| err.into_status())?;
+        /*
+        self.broadcast_transaction(transaction.tx().into_owned())
+            .await
+            .map_err(|err| err.into_status())?;
+        */
+        let response = BroadcastWithdrawalBundleResponse {};
+        Ok(tonic::Response::new(response))
     }
 
     // Legacy Bitcoin Core-based implementation
@@ -712,30 +824,33 @@ impl WalletService for Arc<crate::wallet::Wallet> {
         let amount = value_sats
             .ok_or_else(|| missing_field::<CreateBmmCriticalDataTransactionRequest>("value_sats"))
             .map(bdk_wallet::bitcoin::Amount::from_sat)
-            .map_err(|_| {
-                invalid_field_value::<CreateBmmCriticalDataTransactionRequest>(
+            .map_err(|err| {
+                invalid_field_value::<CreateBmmCriticalDataTransactionRequest, _>(
                     "value_sats",
                     &value_sats.unwrap_or_default().to_string(),
+                    err,
                 )
             })?;
 
         let locktime = height
             .ok_or_else(|| missing_field::<CreateBmmCriticalDataTransactionRequest>("height"))
             .map(bdk_wallet::bitcoin::absolute::LockTime::from_height)?
-            .map_err(|_| {
-                invalid_field_value::<CreateBmmCriticalDataTransactionRequest>(
+            .map_err(|err| {
+                invalid_field_value::<CreateBmmCriticalDataTransactionRequest, _>(
                     "height",
                     &height.unwrap_or_default().to_string(),
+                    err,
                 )
             })?;
 
         let sidechain_number = sidechain_id
             .ok_or_else(|| missing_field::<CreateBmmCriticalDataTransactionRequest>("sidechain_id"))
             .map(SidechainNumber::try_from)?
-            .map_err(|_| {
-                invalid_field_value::<CreateBmmCriticalDataTransactionRequest>(
+            .map_err(|err| {
+                invalid_field_value::<CreateBmmCriticalDataTransactionRequest, _>(
                     "sidechain_id",
                     &sidechain_id.unwrap_or_default().to_string(),
+                    err,
                 )
             })?;
 
@@ -799,9 +914,11 @@ impl WalletService for Arc<crate::wallet::Wallet> {
             })?;
 
         let txid = tx.compute_txid();
+        /*
         self.broadcast_transaction(tx)
             .await
             .map_err(|err| err.into_status())?;
+        */
 
         let txid = convert::bdk_txid_to_bitcoin_txid(txid);
 
@@ -821,31 +938,35 @@ impl WalletService for Arc<crate::wallet::Wallet> {
             value_sats,
             fee_sats,
         } = request.into_inner();
+
         let sidechain_number = sidechain_id
             .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("sidechain_id"))
             .map(SidechainNumber::try_from)?
-            .map_err(|_| {
-                invalid_field_value::<CreateDepositTransactionRequest>(
+            .map_err(|err| {
+                invalid_field_value::<CreateDepositTransactionRequest, _>(
                     "sidechain_id",
                     &sidechain_id.unwrap_or_default().to_string(),
+                    err,
                 )
             })?;
         let address: Vec<u8> = address
             .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("address"))?
             .decode_tonic::<CreateDepositTransactionRequest, _>("address")?;
         if address.is_empty() {
-            return Err(invalid_field_value::<CreateDepositTransactionRequest>(
+            return Err(invalid_field_value::<CreateDepositTransactionRequest, _>(
                 "address",
                 &hex::encode(address),
+                Error::AddressMustBeNonEmpty,
             ));
         }
         let value = value_sats
             .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("value_sats"))
             .map(Amount::from_sat)?;
         if value == Amount::ZERO {
-            return Err(invalid_field_value::<CreateDepositTransactionRequest>(
+            return Err(invalid_field_value::<CreateDepositTransactionRequest, _>(
                 "value_sats",
                 &value.to_string(),
+                Error::ValueMustBeGreaterThanZero,
             ));
         }
         let fee = fee_sats
@@ -871,6 +992,175 @@ impl WalletService for Arc<crate::wallet::Wallet> {
         let response = CreateDepositTransactionResponse { txid: Some(txid) };
         Ok(tonic::Response::new(response))
     }
+
+    async fn get_balance(
+        &self,
+        request: tonic::Request<GetBalanceRequest>,
+    ) -> Result<tonic::Response<GetBalanceResponse>, tonic::Status> {
+        let GetBalanceRequest {} = request.into_inner();
+
+        let balance = self
+            .get_wallet_balance()
+            .await
+            .map_err(|err| err.into_status())?;
+
+        let response = GetBalanceResponse {
+            confirmed_sats: balance.confirmed.to_sat(),
+            pending_sats: (balance.total() - balance.confirmed).to_sat(),
+        };
+
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn list_transactions(
+        &self,
+        _: tonic::Request<ListTransactionsRequest>,
+    ) -> Result<tonic::Response<ListTransactionsResponse>, tonic::Status> {
+        let transactions = self
+            .list_wallet_transactions()
+            .await
+            .map_err(|err| err.into_status())?;
+
+        let response = ListTransactionsResponse {
+            transactions: transactions.iter().map(WalletTransaction::from).collect(),
+        };
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn send_transaction(
+        &self,
+        request: tonic::Request<SendTransactionRequest>,
+    ) -> Result<tonic::Response<SendTransactionResponse>, tonic::Status> {
+        let SendTransactionRequest {
+            destinations,
+            fee_rate,
+            op_return_message,
+        } = request.into_inner();
+
+        // Parse and validate all destination addresses, but assume network valid
+        let destinations_validated = destinations
+            .iter()
+            .map(|(address, amount)| {
+                bdk_wallet::bitcoin::Address::from_str(address)
+                    .map_err(|e| {
+                        tonic::Status::invalid_argument(format!(
+                            "could not parse bitcoin address: {}",
+                            e
+                        ))
+                    })
+                    .map(|addr| (addr.assume_checked(), *amount))
+            })
+            .collect::<Result<HashMap<bdk_wallet::bitcoin::Address, u64>, tonic::Status>>()?;
+
+        let fee_policy = fee_rate
+            .map(|fee_rate| fee_rate.try_into())
+            .transpose()
+            .map_err(|err: crate::proto::Error| err.into_status())?;
+
+        let op_return_message = op_return_message
+            .map(|op_return_message| {
+                op_return_message.decode_tonic::<SendTransactionRequest, _>("op_return_message")
+            })
+            .transpose()?;
+
+        let txid = self
+            .send_wallet_transaction(destinations_validated, fee_policy, op_return_message)
+            .await
+            .map_err(|err| err.into_status())?;
+
+        let txid = ReverseHex::encode(&txid);
+        let response = SendTransactionResponse { txid: Some(txid) };
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn unlock_wallet(
+        &self,
+        request: tonic::Request<UnlockWalletRequest>,
+    ) -> Result<tonic::Response<UnlockWalletResponse>, tonic::Status> {
+        let UnlockWalletRequest { password } = request.into_inner();
+        self.unlock_existing_wallet(password.as_str())
+            .map_err(|err| err.into_status())?;
+
+        Ok(tonic::Response::new(UnlockWalletResponse {}))
+    }
+
+    async fn create_wallet(
+        &self,
+        request: tonic::Request<CreateWalletRequest>,
+    ) -> Result<tonic::Response<CreateWalletResponse>, tonic::Status> {
+        // TODO: needs a way of creating /multiple/ wallets. RPC for unloading/erasing a wallet?
+        if self.is_initialized() {
+            let err = WalletInitialization::AlreadyExists;
+            return Err(tonic::Status::new(
+                tonic::Code::AlreadyExists,
+                format!("{err:#}"),
+            ));
+        }
+
+        let CreateWalletRequest {
+            mut mnemonic_words,
+            mnemonic_path,
+            password,
+        } = request.into_inner();
+
+        if !mnemonic_words.is_empty() && !mnemonic_path.is_empty() {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "cannot provide both mnemonic and mnemonic path",
+            ));
+        }
+
+        if !mnemonic_path.is_empty() {
+            let read = std::fs::read_to_string(&mnemonic_path).map_err(|err| {
+                tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    format!("failed to read mnemonic from {}: {}", mnemonic_path, err),
+                )
+            })?;
+
+            mnemonic_words = read.split_whitespace().map(|s| s.to_string()).collect();
+        }
+
+        if !mnemonic_words.is_empty() && mnemonic_words.len() != 12 {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "mnemonic must be 12 words",
+            ));
+        }
+
+        let parsed = if mnemonic_words.is_empty() {
+            None
+        } else {
+            Some(
+                Mnemonic::from_str(&mnemonic_words.join(" ")).map_err(|err| {
+                    tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        format!("failed to parse mnemonic: {err:#}"),
+                    )
+                })?,
+            )
+        };
+
+        let password = if password.is_empty() {
+            None
+        } else {
+            Some(password.as_str())
+        };
+
+        self.create_wallet(parsed, password)
+            .map_err(|err| err.into_status())?;
+
+        Ok(tonic::Response::new(CreateWalletResponse {}))
+    }
+}
+
+#[derive(Debug, Error)]
+enum Error {
+    #[error("value must be greater than zero")]
+    ValueMustBeGreaterThanZero,
+
+    #[error("address must be non-empty")]
+    AddressMustBeNonEmpty,
 }
 
 #[derive(Debug, Default)]
@@ -892,7 +1182,7 @@ impl CryptoService for CryptoServiceServer {
             .decode_tonic::<Ripemd160Request, _>("msg")?;
         let digest = ripemd160::Hash::hash(&msg);
         let response = Ripemd160Response {
-            digest: Some(ConsensusHex::encode_hex(&digest.as_byte_array())),
+            digest: Some(Hex::encode(&digest.as_byte_array())),
         };
         Ok(tonic::Response::new(response))
     }
@@ -912,7 +1202,7 @@ impl CryptoService for CryptoServiceServer {
         engine.input(&msg);
         let hmac = hmac::Hmac::<sha512::Hash>::from_engine(engine);
         let response = HmacSha512Response {
-            hmac: Some(ConsensusHex::encode_hex(&hmac.as_byte_array())),
+            hmac: Some(Hex::encode(&hmac.as_byte_array())),
         };
         Ok(tonic::Response::new(response))
     }
@@ -926,15 +1216,14 @@ impl CryptoService for CryptoServiceServer {
         let secret_key: [u8; SECP256K1_SECRET_KEY_LENGTH] = secret_key
             .ok_or_else(|| missing_field::<Secp256k1SecretKeyToPublicKeyRequest>("secret_key"))?
             .decode_tonic::<Secp256k1SecretKeyToPublicKeyRequest, _>("secret_key")?;
-        let secret_key =
-            bitcoin::secp256k1::SecretKey::from_slice(&secret_key).map_err(|_err| {
-                invalid_field_value::<Secp256k1SecretKeyToPublicKeyRequest>("secret_key", "")
-            })?;
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&secret_key).map_err(|err| {
+            invalid_field_value::<Secp256k1SecretKeyToPublicKeyRequest, _>("secret_key", "", err)
+        })?;
         let secp = Secp256k1::new();
         let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
         let public_key: [u8; SECP256K1_PUBLIC_KEY_LENGTH] = public_key.serialize();
         let response = Secp256k1SecretKeyToPublicKeyResponse {
-            public_key: Some(ConsensusHex::encode_hex(&public_key)),
+            public_key: Some(ConsensusHex::encode(&public_key)),
         };
         Ok(tonic::Response::new(response))
     }
@@ -956,12 +1245,12 @@ impl CryptoService for CryptoServiceServer {
             .ok_or_else(|| missing_field::<Secp256k1SignRequest>("secret_key"))?
             .decode_tonic::<Secp256k1SignRequest, _>("secret_key")?;
         let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&secret_key)
-            .map_err(|_err| invalid_field_value::<Secp256k1SignRequest>("secret_key", ""))?;
+            .map_err(|err| invalid_field_value::<Secp256k1SignRequest, _>("secret_key", "", err))?;
         let secp = Secp256k1::new();
         let signature = secp.sign_ecdsa(&message, &secret_key);
         let signature = signature.serialize_compact();
         let response = Secp256k1SignResponse {
-            signature: Some(ConsensusHex::encode_hex(&signature)),
+            signature: Some(Hex::encode(&signature)),
         };
         Ok(tonic::Response::new(response))
     }
@@ -992,19 +1281,23 @@ impl CryptoService for CryptoServiceServer {
                 )
             })?;
         let signature =
-            bitcoin::secp256k1::ecdsa::Signature::from_compact(&signature).map_err(|_err| {
-                invalid_field_value::<Secp256k1VerifyRequest>("signature", &hex::encode(signature))
+            bitcoin::secp256k1::ecdsa::Signature::from_compact(&signature).map_err(|err| {
+                invalid_field_value::<Secp256k1VerifyRequest, _>(
+                    "signature",
+                    &hex::encode(signature),
+                    err,
+                )
             })?;
         let public_key: [u8; SECP256K1_PUBLIC_KEY_LENGTH] = public_key
             .ok_or_else(|| missing_field::<Secp256k1VerifyRequest>("public_key"))?
             .decode_tonic::<Secp256k1VerifyRequest, _>("public_key")?;
-        let public_key =
-            bitcoin::secp256k1::PublicKey::from_slice(&public_key).map_err(|_err| {
-                invalid_field_value::<Secp256k1VerifyRequest>(
-                    "public_key",
-                    &hex::encode(public_key),
-                )
-            })?;
+        let public_key = bitcoin::secp256k1::PublicKey::from_slice(&public_key).map_err(|err| {
+            invalid_field_value::<Secp256k1VerifyRequest, _>(
+                "public_key",
+                &hex::encode(public_key),
+                err,
+            )
+        })?;
         let secp = Secp256k1::new();
         let valid = secp.verify_ecdsa(&message, &signature, &public_key).is_ok();
         let response = Secp256k1VerifyResponse { valid };

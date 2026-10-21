@@ -1,10 +1,11 @@
 use std::{
     borrow::BorrowMut,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
+    net::SocketAddr,
     path::Path,
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use bdk_electrum::{
@@ -20,112 +21,80 @@ use bdk_wallet::{
     ChangeSet, KeychainKind,
 };
 use bip300301::{
-    client::{BlockchainInfo, GetRawTransactionClient, GetRawTransactionVerbose},
+    client::{GetRawTransactionClient, GetRawTransactionVerbose},
     jsonrpsee::http_client::HttpClient,
     MainClient,
 };
 use bitcoin::{
-    absolute::{Height, LockTime},
-    block::Version as BlockVersion,
-    consensus::{Decodable as _, Encodable as _},
-    constants::{genesis_block, SUBSIDY_HALVING_INTERVAL},
-    hash_types::TxMerkleNode,
-    hashes::{sha256d, Hash as _},
-    merkle_tree,
-    opcodes::{
-        all::{OP_PUSHBYTES_36, OP_RETURN},
-        OP_0,
-    },
-    transaction::Version as TxVersion,
-    Amount, Block, Network, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    consensus::Encodable as _,
+    hashes::{sha256, sha256d, Hash as _, HashEngine},
+    script::PushBytesBuf,
+    Amount, Network, Transaction, Txid,
 };
-use miette::{miette, IntoDiagnostic, Result};
-use parking_lot::{Mutex, RwLock};
-use rusqlite::{Connection, Row};
+use either::Either;
+use error::WalletInitialization;
+use fallible_iterator::{FallibleIterator as _, IteratorExt as _};
+use futures::{StreamExt as _, TryFutureExt as _};
+use miette::{miette, IntoDiagnostic, Report, Result};
+use mnemonic::{new_mnemonic, EncryptedMnemonic};
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use rusqlite::Connection;
+use tokio::{
+    spawn,
+    task::{block_in_place, JoinHandle},
+    time::interval,
+};
+use tokio_stream::wrappers::IntervalStream;
 
 use crate::{
-    cli::WalletConfig,
+    cli::{Config, WalletConfig},
     convert,
-    messages::{self, CoinbaseBuilder, M8_BMM_REQUEST_TAG},
-    types::{Ctip, SidechainAck, SidechainNumber, SidechainProposal},
+    messages::{self, M8BmmRequest},
+    types::{
+        BDKWalletTransaction, BlindedM6, Ctip, M6id, PendingM6idInfo, SidechainAck,
+        SidechainNumber, SidechainProposal, SidechainProposalId, WithdrawalBundleEventKind,
+    },
     validator::Validator,
 };
 
+mod cusf_block_producer;
 pub mod error;
+mod mine;
+mod mnemonic;
 
-#[derive(Debug)]
-pub struct Deposit {
-    pub sidechain_number: u8,
-    pub address: Vec<u8>,
-    pub amount: u64,
-    pub transaction: Transaction,
-}
+type BundleProposals = Vec<(M6id, BlindedM6<'static>, Option<PendingM6idInfo>)>;
 
-fn get_block_value(height: u32, fees: Amount, network: Network) -> Amount {
-    let subsidy_sats = 50 * Amount::ONE_BTC.to_sat();
-    let subsidy_halving_interval = match network {
-        Network::Regtest => 150,
-        _ => SUBSIDY_HALVING_INTERVAL,
-    };
-    let halvings = height / subsidy_halving_interval;
-    if halvings >= 64 {
-        fees
-    } else {
-        fees + Amount::from_sat(subsidy_sats >> halvings)
-    }
-}
+type BdkWallet = bdk_wallet::PersistedWallet<file_store::Store<ChangeSet>>;
 
-pub struct Wallet {
+struct WalletInner {
     main_client: HttpClient,
     validator: Validator,
-    bitcoin_wallet: Mutex<bdk_wallet::PersistedWallet<file_store::Store<ChangeSet>>>,
+    // Unlocked, ready-to-go wallet: Some
+    // Locked wallet: None
+    bitcoin_wallet: RwLock<Option<BdkWallet>>,
     bitcoin_db: Mutex<file_store::Store<ChangeSet>>,
-    db_connection: Arc<Mutex<rusqlite::Connection>>,
+    db_connection: Mutex<rusqlite::Connection>,
     bitcoin_blockchain: BdkElectrumClient<bdk_electrum::electrum_client::Client>,
-    last_sync: Arc<RwLock<Option<SystemTime>>>,
+    last_sync: RwLock<Option<SystemTime>>,
 }
 
-impl Wallet {
-    pub async fn new(
-        data_dir: &Path,
-        config: &WalletConfig,
-        main_client: HttpClient,
-        validator: Validator,
-    ) -> Result<Self> {
-        let mnemonic = Mnemonic::parse_in_normalized(
-            Language::English,
-            "betray annual dog current tomorrow media ghost dynamic mule length sure salad",
-        )
-        .into_diagnostic()?;
-        // Generate the extended key
-        let xkey: ExtendedKey = mnemonic.clone().into_extended_key().into_diagnostic()?;
-        // Get xprv from the extended key
-        let network = {
-            let validator_network = validator.network();
-            bdk_wallet::bitcoin::Network::from_str(validator_network.to_string().as_str())
-                .into_diagnostic()?
-        };
+impl WalletInner {
+    fn initialize_wallet_from_mnemonic(
+        mnemonic: &Mnemonic,
+        network: bdk_wallet::bitcoin::Network,
+        wallet_database: &mut file_store::Store<ChangeSet>,
+    ) -> Result<bdk_wallet::PersistedWallet<file_store::Store<ChangeSet>>, miette::Report> {
+        let extended_key: ExtendedKey = mnemonic.clone().into_extended_key().into_diagnostic()?;
 
-        tracing::info!(
-            "Instantiating {} wallet with data dir: {}",
-            network,
-            data_dir.display()
-        );
-
-        let xprv = xkey
+        let xpriv = extended_key
             .into_xprv(network)
-            .ok_or(miette!("couldn't get xprv"))?;
-
-        let mut wallet_database = file_store::Store::open_or_create_new(
-            b"bip300301_enforcer",
-            data_dir.join("wallet.db"),
-        )
-        .into_diagnostic()?;
+            .ok_or(miette!("unable to derive xpriv from extended key"))?;
 
         // Create a BDK wallet structure using BIP 84 descriptor ("m/84h/1h/0h/0" and "m/84h/1h/0h/1")
-
-        let external_desc = format!("wpkh({xprv}/84'/1'/0'/0/*)");
-        let internal_desc = format!("wpkh({xprv}/84'/1'/0'/1/*)");
+        let external_desc = format!("wpkh({xpriv}/84'/1'/0'/0/*)");
+        let internal_desc = format!("wpkh({xpriv}/84'/1'/0'/1/*)");
 
         tracing::debug!("Attempting load of existing BDK wallet");
         let bitcoin_wallet = bdk_wallet::Wallet::load()
@@ -133,8 +102,16 @@ impl Wallet {
             .descriptor(KeychainKind::Internal, Some(internal_desc.clone()))
             .extract_keys()
             .check_network(network)
-            .load_wallet(&mut wallet_database)
-            .map_err(|err| miette!("failed to load wallet: {err:#}"))?;
+            .load_wallet(wallet_database)
+            .map_err(|err| match err {
+                e if e.to_string().contains("data mismatch") => {
+                    tracing::error!(
+                        "Wallet data mismatch! Wipe your data directory and try again."
+                    );
+                    WalletInitialization::DataMismatch.into()
+                }
+                err => miette!("failed to load wallet: {err:#}"),
+            })?;
 
         let bitcoin_wallet = match bitcoin_wallet {
             Some(wallet) => {
@@ -147,10 +124,37 @@ impl Wallet {
 
                 bdk_wallet::Wallet::create(external_desc, internal_desc)
                     .network(network)
-                    .create_wallet(&mut wallet_database)
+                    .create_wallet(wallet_database)
                     .map_err(|err| miette!("failed to create wallet: {err:#}"))?
             }
         };
+
+        Ok(bitcoin_wallet)
+    }
+
+    fn new(
+        data_dir: &Path,
+        config: &WalletConfig,
+        main_client: HttpClient,
+        validator: Validator,
+    ) -> Result<Self, miette::Report> {
+        let network = {
+            let validator_network = validator.network();
+            bdk_wallet::bitcoin::Network::from_str(validator_network.to_string().as_str())
+                .into_diagnostic()?
+        };
+
+        tracing::info!(
+            "Instantiating {} wallet with data dir: {}",
+            network,
+            data_dir.display()
+        );
+
+        let mut wallet_database = file_store::Store::open_or_create_new(
+            b"bip300301_enforcer",
+            data_dir.join("wallet.db"),
+        )
+        .into_diagnostic()?;
 
         let bitcoin_blockchain = {
             let (default_host, default_port) = match network {
@@ -200,9 +204,10 @@ impl Wallet {
             let migrations = Migrations::new(vec![
                 M::up(
                     "CREATE TABLE sidechain_proposals
-                   (number INTEGER NOT NULL,
+                   (sidechain_number INTEGER NOT NULL,
+                    data_hash BLOB NOT NULL,
                     data BLOB NOT NULL,
-                    UNIQUE(number, data));",
+                    UNIQUE(sidechain_number, data_hash));",
                 ),
                 M::up(
                     "CREATE TABLE sidechain_acks
@@ -214,6 +219,7 @@ impl Wallet {
                     "CREATE TABLE bundle_proposals
                    (sidechain_number INTEGER NOT NULL,
                     bundle_hash BLOB NOT NULL,
+                    bundle_tx BLOB NOT NULL,
                     UNIQUE(sidechain_number, bundle_hash));",
                 ),
                 M::up(
@@ -222,31 +228,30 @@ impl Wallet {
                     bundle_hash BLOB NOT NULL,
                     UNIQUE(sidechain_number, bundle_hash));",
                 ),
-                // TODO: delete this? Not persisting to this table anywhere.
-                // Not clear how we're going to keep this in sync with the
-                // actual mempool. Seems like we could accomplish the same
-                // thing through `listtransactions`
-                M::up(
-                    "CREATE TABLE mempool
-                   (txid BLOB UNIQUE NOT NULL,
-                    tx_data BLOB NOT NULL);",
-                ),
-                // This is really a table of _pending_ deposits. Gets wiped
-                // upon generating a fresh block. How will this work for
-                // non-regtest?
-                M::up(
-                    "CREATE TABLE deposits
-                   (sidechain_number INTEGER NOT NULL,
-                    address BLOB NOT NULl,
-                    amount INTEGER NOT NULL,
-                    txid BLOB NOT NULL);",
-                ),
                 M::up(
                     "CREATE TABLE bmm_requests
                     (sidechain_number INTEGER NOT NULL,
                      prev_block_hash BLOB NOT NULL,
                      side_block_hash BLOB NOT NULL,
                      UNIQUE(sidechain_number, prev_block_hash));",
+                ),
+                M::up(
+                    "CREATE TABLE wallet_seeds
+                    (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     plaintext_mnemonic TEXT, 
+
+                     -- encryption values 
+                     initialization_vector BLOB, 
+                     ciphertext_mnemonic BLOB, 
+                     key_salt BLOB,
+
+                     -- boolean that indicates if the wallet uses a BIP39 passphrase
+                     needs_passphrase BOOLEAN NOT NULL DEFAULT FALSE, 
+
+                     -- timestamp of the creation of the seed
+                     creation_time DATETIME NOT NULL DEFAULT (DATETIME('now')) 
+                    );",
                 ),
             ]);
 
@@ -262,129 +267,403 @@ impl Wallet {
             db_connection
         };
 
-        let wallet = Self {
+        // If we:
+        // 1. Already have an initialized wallet
+        // 2. It's plaintext
+        //
+        // We can just go ahead and unlock the wallet right away.
+        let bitcoin_wallet =
+            if let Some(Either::Left(mnemonic)) = WalletInner::read_db_mnemonic(&db_connection)? {
+                tracing::debug!("found plaintext mnemonic, going straight to initialization");
+                let initialized = WalletInner::initialize_wallet_from_mnemonic(
+                    &mnemonic,
+                    network,
+                    &mut wallet_database,
+                )?;
+
+                Some(initialized)
+            } else {
+                None
+            };
+
+        tracing::debug!(
+            message = "wallet inner: wired together components",
+            wallet_initialized = bitcoin_wallet.is_some()
+        );
+
+        Ok(Self {
             main_client,
             validator,
-            // bitcoin_wallet: Arc::new(Mutex::new(bitcoin_wallet)),
-            bitcoin_wallet: Mutex::new(bitcoin_wallet),
+            bitcoin_wallet: RwLock::new(bitcoin_wallet),
             bitcoin_db: Mutex::new(wallet_database),
-            db_connection: Arc::new(Mutex::new(db_connection)),
+            db_connection: Mutex::new(db_connection),
             bitcoin_blockchain,
+            last_sync: RwLock::new(None),
+        })
+    }
 
-            last_sync: Arc::new(RwLock::new(None)),
+    fn read_wallet(&self) -> Result<MappedRwLockReadGuard<BdkWallet>, WalletInitialization> {
+        let read_guard = self.bitcoin_wallet.read();
+        RwLockReadGuard::try_map(read_guard, |wallet| wallet.as_ref())
+            .map_err(|_| WalletInitialization::NotUnlocked)
+    }
+
+    fn write_wallet(&self) -> Result<MappedRwLockWriteGuard<BdkWallet>, WalletInitialization> {
+        let read_guard = self.bitcoin_wallet.write();
+        RwLockWriteGuard::try_map(read_guard, |wallet| wallet.as_mut())
+            .map_err(|_| WalletInitialization::NotUnlocked)
+    }
+
+    pub fn create_new_wallet(
+        &self,
+        mnemonic: Option<Mnemonic>,
+        password: Option<&str>,
+    ) -> Result<(), miette::Report> {
+        if WalletInner::read_db_mnemonic(&self.db_connection.lock())?.is_some() {
+            return Err(WalletInitialization::AlreadyExists.into());
+        }
+
+        let mnemonic = match mnemonic {
+            Some(mnemonic) => mnemonic,
+            None => {
+                tracing::info!("create new wallet: no mnemonic provided, generating fresh");
+                new_mnemonic()?
+            }
         };
-        Ok(wallet)
+
+        match password {
+            // Encrypt the mnemonic and insert
+            Some(password) => {
+                tracing::info!("create new wallet: persisting encrypted mnemonic");
+                let encrypted = EncryptedMnemonic::encrypt(&mnemonic, password)?;
+
+                // Satisfy clippy with a single function call per lock
+                let with_connection = |connection: &Connection| -> Result<_, miette::Report> {
+                    let mut statement = connection
+                        .prepare(
+                            "INSERT INTO wallet_seeds (initialization_vector, 
+                            ciphertext_mnemonic, key_salt) VALUES (?, ?, ?)",
+                        )
+                        .into_diagnostic()?;
+
+                    statement
+                        .execute((
+                            encrypted.initialization_vector,
+                            encrypted.ciphertext_mnemonic,
+                            encrypted.key_salt,
+                        ))
+                        .into_diagnostic()?;
+
+                    Ok(())
+                };
+
+                with_connection(&self.db_connection.lock())?
+            }
+            None => {
+                tracing::info!(
+                    "create new wallet: no password provided, persisting plaintext mnemonic"
+                );
+
+                // Satisfy clippy with a single function call per lock
+                let with_connection = |connection: &Connection| -> Result<_, miette::Report> {
+                    let mut statement = connection
+                        .prepare("INSERT INTO wallet_seeds (plaintext_mnemonic) VALUES (?)")
+                        .into_diagnostic()?;
+
+                    statement
+                        .execute([mnemonic.to_string()])
+                        .into_diagnostic()?;
+                    Ok(())
+                };
+
+                with_connection(&self.db_connection.lock())?
+            }
+        }
+
+        let mut database = self.bitcoin_db.lock();
+        let network = self.validator.network();
+        let wallet =
+            WalletInner::initialize_wallet_from_mnemonic(&mnemonic, network, &mut database)?;
+        drop(database);
+
+        let mut write_guard = self.bitcoin_wallet.write();
+        *write_guard = Some(wallet);
+        drop(write_guard);
+        Ok(())
+    }
+
+    pub fn unlock_existing_wallet(&self, password: &str) -> Result<(), miette::Report> {
+        if self.bitcoin_wallet.read().is_some() {
+            return Err(WalletInitialization::AlreadyUnlocked.into());
+        }
+
+        // Read the mnemonic from the database.
+        let read = WalletInner::read_db_mnemonic(&self.db_connection.lock())?;
+
+        tracing::debug!("unlock wallet: read from DB");
+
+        // Verify that it is encrypted!
+        let encrypted = match read {
+            None => {
+                return Err(WalletInitialization::NotFound.into());
+            }
+            // Plaintext!
+            Some(Either::Left(_)) => {
+                return Err(miette!("wallet is not encrypted"));
+            }
+            Some(Either::Right(encrypted)) => encrypted,
+        };
+
+        tracing::debug!("unlock wallet: decrypting mnemonic");
+
+        let mnemonic = encrypted.decrypt(password).map_err(|err| {
+            tracing::error!("failed to decrypt mnemonic: {err:#}");
+            WalletInitialization::InvalidPassword
+        })?;
+
+        let mut database = self.bitcoin_db.lock();
+        let network = self.validator.network();
+
+        tracing::debug!("unlock wallet: initializing BDK wallet struct");
+        let wallet =
+            WalletInner::initialize_wallet_from_mnemonic(&mnemonic, network, &mut database)?;
+        drop(database);
+
+        let mut write_guard = self.bitcoin_wallet.write();
+        *write_guard = Some(wallet);
+        drop(write_guard);
+
+        tracing::info!("unlock wallet: initialized wallet");
+        Ok(())
+    }
+
+    fn read_db_mnemonic(
+        connection: &Connection,
+    ) -> Result<Option<Either<Mnemonic, EncryptedMnemonic>>, miette::Report> {
+        let mut statement = connection
+            .prepare(
+                "SELECT plaintext_mnemonic, initialization_vector, 
+                            ciphertext_mnemonic, key_salt FROM wallet_seeds",
+            )
+            .into_diagnostic()?;
+
+        let statement_result = statement.query_row([], |row| {
+            let plaintext_mnemonic: Option<String> = row.get("plaintext_mnemonic")?;
+            let iv: Option<Vec<u8>> = row.get("initialization_vector")?;
+            let ciphertext: Option<Vec<u8>> = row.get("ciphertext_mnemonic")?;
+            let key_salt: Option<Vec<u8>> = row.get("key_salt")?;
+            Ok((plaintext_mnemonic, iv, ciphertext, key_salt))
+        });
+        let res = match statement_result {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(err) => return Err(miette!("failed to read mnemonic from DB: {err:#}")),
+        };
+
+        match res {
+            (Some(plaintext_mnemonic), None, None, None) => {
+                let mnemonic =
+                    Mnemonic::parse_in_normalized(Language::English, plaintext_mnemonic.as_str())
+                        .into_diagnostic()?;
+
+                Ok(Some(Either::Left(mnemonic)))
+            }
+            (None, Some(iv), Some(ciphertext), Some(key_salt)) => {
+                Ok(Some(Either::Right(EncryptedMnemonic {
+                    initialization_vector: iv,
+                    ciphertext_mnemonic: ciphertext,
+                    key_salt,
+                })))
+            }
+
+            // This is a sanity check, and should never really happen.
+            // Don't print out the actual contents, just indicate which values are set/not set.
+            (plaintext_mnemonic, iv, ciphertext, key_salt) => {
+                let plaintext_mnemonic = if plaintext_mnemonic.is_some() {
+                    "Some"
+                } else {
+                    "None"
+                };
+                let iv = if iv.is_some() { "Some" } else { "None" };
+                let ciphertext = if ciphertext.is_some() { "Some" } else { "None" };
+                let key_salt = if key_salt.is_some() { "Some" } else { "None" };
+                Err(miette!("invalid mnemonic DB state: plaintext_mnemonic={plaintext_mnemonic} iv={iv} ciphertext={ciphertext} key_salt={key_salt}"))
+            }
+        }
+    }
+
+    // Gets wiped upon generating a new block.
+    // TODO: how will this work for non-regtest?
+    fn delete_bundle_proposals<I>(&self, iter: I) -> Result<(), rusqlite::Error>
+    where
+        I: IntoIterator<Item = (SidechainNumber, M6id)>,
+    {
+        // Satisfy clippy with a single function call per lock
+        let with_connection = |connection: &Connection| -> Result<_, _> {
+            for (sidechain_number, m6id) in iter {
+                let _ = connection.execute(
+                    "DELETE FROM bundle_proposals where sidechain_number = ?1 AND bundle_hash = ?2;",
+                    (sidechain_number.0, m6id.0.as_byte_array())
+                )?;
+            }
+            Ok(())
+        };
+        with_connection(&self.db_connection.lock())
+    }
+
+    // Gets wiped upon generating a new block.
+    // TODO: how will this work for non-regtest?
+    fn delete_pending_sidechain_proposals<I>(&self, proposals: I) -> Result<(), rusqlite::Error>
+    where
+        I: IntoIterator<Item = SidechainProposalId>,
+    {
+        let with_connection = |connection: &Connection| -> Result<_, rusqlite::Error> {
+            for proposal_id in proposals {
+                let _ = connection.execute(
+                    "DELETE FROM sidechain_proposals where sidechain_number = ?1 AND data_hash = ?2;",
+                    (proposal_id.sidechain_number.0, proposal_id.description_hash.as_byte_array())
+                )?;
+            }
+            Ok(())
+        };
+        with_connection(&self.db_connection.lock())
+    }
+
+    fn handle_connect_block(
+        &self,
+        block_info: crate::types::BlockInfo,
+    ) -> Result<(), rusqlite::Error> {
+        let finalized_withdrawal_bundles =
+            block_info
+                .withdrawal_bundle_events()
+                .filter_map(|event| match event.kind {
+                    WithdrawalBundleEventKind::Failed
+                    | WithdrawalBundleEventKind::Succeeded {
+                        sequence_number: _,
+                        transaction: _,
+                    } => Some((event.sidechain_id, event.m6id)),
+                    WithdrawalBundleEventKind::Submitted => None,
+                });
+        let () = self.delete_bundle_proposals(finalized_withdrawal_bundles)?;
+        let sidechain_proposals = block_info
+            .sidechain_proposals()
+            .map(|(_vout, proposal)| proposal.into());
+        let () = self.delete_pending_sidechain_proposals(sidechain_proposals)?;
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<(), miette::Report> {
+        let start = SystemTime::now();
+        tracing::trace!("starting wallet sync");
+
+        // Don't error out here if the wallet is locked, just skip the sync.
+        let mut wallet_write = if let Ok(wallet_write) = self.write_wallet() {
+            wallet_write
+        } else {
+            tracing::trace!("wallet is locked, skipping sync");
+            return Ok(());
+        };
+
+        let mut last_sync_write = self.last_sync.write();
+        let request = wallet_write.start_sync_with_revealed_spks();
+
+        const BATCH_SIZE: usize = 5;
+        const FETCH_PREV_TXOUTS: bool = false;
+
+        let update = self
+            .bitcoin_blockchain
+            .sync(request, BATCH_SIZE, FETCH_PREV_TXOUTS)
+            .into_diagnostic()?;
+
+        wallet_write.apply_update(update).into_diagnostic()?;
+
+        let mut database = self.bitcoin_db.lock();
+        wallet_write.persist(&mut database).into_diagnostic()?;
+
+        tracing::debug!(
+            "wallet sync complete in {:?}",
+            start.elapsed().unwrap_or_default(),
+        );
+
+        *last_sync_write = Some(SystemTime::now());
+        drop(last_sync_write);
+        drop(wallet_write);
+        Ok(())
+    }
+}
+
+pub struct Task {
+    sync: JoinHandle<()>,
+}
+
+impl Task {
+    // TODO: return `Result<!, _>` once `never_type` is stabilized
+    async fn sync_task(wallet: Arc<WalletInner>) -> Result<(), miette::Report> {
+        const SYNC_INTERVAL: Duration = Duration::from_secs(15);
+        tracing::debug!(
+            "wallet sync task: starting with interval {:?}",
+            SYNC_INTERVAL
+        );
+
+        let mut interval_stream = IntervalStream::new(interval(SYNC_INTERVAL));
+        while let Some(_instant) = interval_stream.next().await {
+            let () = block_in_place(|| wallet.sync())?;
+        }
+        Ok(())
+    }
+
+    fn new(wallet: Arc<WalletInner>) -> Self {
+        Self {
+            sync: spawn(
+                Self::sync_task(wallet)
+                    .unwrap_or_else(|err| tracing::error!("wallet sync error: {err:#}")),
+            ),
+        }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        let Self { sync } = self;
+        sync.abort();
+    }
+}
+
+/// Cheap to clone, since it uses Arc internally
+#[derive(Clone)]
+pub struct Wallet {
+    serve_rpc_addr: SocketAddr,
+    inner: Arc<WalletInner>,
+    _task: Arc<Task>,
+}
+
+impl Wallet {
+    pub fn new(
+        data_dir: &Path,
+        config: &Config,
+        main_client: HttpClient,
+        validator: Validator,
+    ) -> Result<Self> {
+        let inner = Arc::new(WalletInner::new(
+            data_dir,
+            &config.wallet_opts,
+            main_client,
+            validator,
+        )?);
+        let task = Task::new(inner.clone());
+        Ok(Self {
+            serve_rpc_addr: config.serve_rpc_addr,
+            inner,
+            _task: Arc::new(task),
+        })
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.inner.bitcoin_wallet.read().is_some()
     }
 
     pub fn validator(&self) -> &Validator {
-        &self.validator
-    }
-
-    pub async fn generate_block(
-        &self,
-        coinbase_outputs: &[TxOut],
-        transactions: Vec<Transaction>,
-    ) -> Result<Block> {
-        let addr = self.get_new_address()?;
-
-        tracing::debug!("Generate block: fetched address: {}", addr);
-
-        let script_pubkey = addr.script_pubkey();
-
-        let BlockchainInfo {
-            blocks: block_height,
-            best_blockhash,
-            ..
-        } = self
-            .main_client
-            .get_blockchain_info()
-            .await
-            .map_err(|err| error::BitcoinCoreRPC {
-                method: "getblockchaininfo".to_string(),
-                error: err,
-            })?;
-
-        tracing::debug!("Generate block: found best block: `{best_blockhash}` @ {block_height}",);
-
-        let start = SystemTime::now();
-        let time = start
-            .duration_since(UNIX_EPOCH)
-            .into_diagnostic()?
-            .as_secs() as u32;
-
-        let script_sig = bitcoin::blockdata::script::Builder::new()
-            .push_int((block_height + 1) as i64)
-            .push_opcode(OP_0)
-            .into_script();
-
-        let value = get_block_value(block_height + 1, Amount::ZERO, Network::Regtest);
-
-        let output = if value > Amount::ZERO {
-            vec![TxOut {
-                script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_bytes()),
-                value,
-            }]
-        } else {
-            vec![TxOut {
-                script_pubkey: ScriptBuf::builder().push_opcode(OP_RETURN).into_script(),
-                value: Amount::ZERO,
-            }]
-        };
-
-        const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
-
-        let txdata = [
-            vec![Transaction {
-                version: TxVersion::TWO,
-                lock_time: LockTime::Blocks(Height::ZERO),
-                input: vec![TxIn {
-                    previous_output: bitcoin::OutPoint {
-                        txid: Txid::all_zeros(),
-                        vout: 0xFFFF_FFFF,
-                    },
-                    sequence: Sequence::MAX,
-                    witness: Witness::from_slice(&[WITNESS_RESERVED_VALUE]),
-                    script_sig,
-                }],
-                output: [&output, coinbase_outputs].concat(),
-            }],
-            transactions,
-        ]
-        .concat();
-
-        let genesis_block = genesis_block(bitcoin::Network::Regtest);
-        let bits = genesis_block.header.bits;
-        let header = bitcoin::block::Header {
-            version: BlockVersion::NO_SOFT_FORK_SIGNALLING,
-            prev_blockhash: best_blockhash,
-            // merkle root is computed after the witness commitment is added to coinbase
-            merkle_root: TxMerkleNode::all_zeros(),
-            time,
-            bits,
-            nonce: 0,
-        };
-        let mut block = Block { header, txdata };
-        let witness_root = block.witness_root().unwrap();
-        let witness_commitment =
-            Block::compute_witness_commitment(&witness_root, &WITNESS_RESERVED_VALUE);
-
-        let script_pubkey_bytes = [
-            vec![OP_RETURN.to_u8(), OP_PUSHBYTES_36.to_u8()],
-            vec![0xaa, 0x21, 0xa9, 0xed],
-            witness_commitment.as_byte_array().into(),
-        ]
-        .concat();
-        let script_pubkey = ScriptBuf::from_bytes(script_pubkey_bytes);
-        block.txdata[0].output.push(TxOut {
-            script_pubkey,
-            value: bitcoin::Amount::ZERO,
-        });
-        let mut tx_hashes: Vec<_> = block.txdata.iter().map(Transaction::compute_txid).collect();
-        block.header.merkle_root = merkle_tree::calculate_root_inline(&mut tx_hashes)
-            .unwrap()
-            .to_raw_hash()
-            .into();
-        Ok(block)
+        &self.inner.validator
     }
 
     /// Returns pending sidechain proposals from the wallet. These are not yet
@@ -393,7 +672,7 @@ impl Wallet {
         // Satisfy clippy with a single function call per lock
         let with_connection = |connection: &Connection| -> Result<_, rusqlite::Error> {
             let mut statement =
-                connection.prepare("SELECT number, data FROM sidechain_proposals")?;
+                connection.prepare("SELECT sidechain_number, data FROM sidechain_proposals")?;
 
             let proposals = statement
                 .query_map([], |row| {
@@ -408,15 +687,14 @@ impl Wallet {
 
             Ok(proposals)
         };
-        with_connection(&self.db_connection.lock())
+        with_connection(&self.inner.db_connection.lock())
     }
 
-    fn get_sidechain_acks(&self) -> Result<Vec<SidechainAck>> {
+    fn get_sidechain_acks(&self) -> Result<Vec<SidechainAck>, rusqlite::Error> {
         // Satisfy clippy with a single function call per lock
-        let with_connection = |connection: &Connection| -> Result<_> {
-            let mut statement = connection
-                .prepare("SELECT number, data_hash FROM sidechain_acks")
-                .into_diagnostic()?;
+        let with_connection = |connection: &Connection| -> Result<_, _> {
+            let mut statement =
+                connection.prepare("SELECT number, data_hash FROM sidechain_acks")?;
             let rows = statement
                 .query_map([], |row| {
                     let description_hash: [u8; 32] = row.get(1)?;
@@ -424,21 +702,76 @@ impl Wallet {
                         sidechain_number: SidechainNumber(row.get(0)?),
                         description_hash: sha256d::Hash::from_byte_array(description_hash),
                     })
-                })
-                .into_diagnostic()?
-                .collect::<Result<_, _>>()
-                .into_diagnostic()?;
+                })?
+                .collect::<Result<_, _>>()?;
             Ok(rows)
         };
-        with_connection(&self.db_connection.lock())
+        with_connection(&self.inner.db_connection.lock())
+    }
+
+    fn get_bundle_proposals(
+        &self,
+    ) -> Result<HashMap<SidechainNumber, BundleProposals>, error::GetBundleProposals> {
+        // Satisfy clippy with a single function call per lock
+        let with_connection = |connection: &Connection| -> Result<_, error::GetBundleProposals> {
+            let mut statement = connection
+                .prepare("SELECT sidechain_number, bundle_hash, bundle_tx FROM bundle_proposals")?;
+            let mut bundle_proposals = HashMap::<_, Vec<_>>::new();
+            let () = statement
+                .query_map([], |row| {
+                    let sidechain_number = SidechainNumber(row.get(0)?);
+                    let m6id_bytes: [u8; 32] = row.get(1)?;
+                    let m6id = M6id::from(m6id_bytes);
+                    let bundle_tx_bytes: Vec<u8> = row.get(2)?;
+                    Ok((sidechain_number, m6id, bundle_tx_bytes))
+                })?
+                .transpose_into_fallible()
+                .map_err(error::GetBundleProposals::from)
+                .for_each(|(sidechain_number, m6id, bundle_tx_bytes)| {
+                    let bundle_proposal_tx = bitcoin::consensus::deserialize(&bundle_tx_bytes)?;
+                    let bundle_proposal_tx =
+                        BlindedM6::try_from(std::borrow::Cow::Owned(bundle_proposal_tx))?;
+                    bundle_proposals
+                        .entry(sidechain_number)
+                        .or_default()
+                        .push((m6id, bundle_proposal_tx));
+                    Ok(())
+                })?;
+            Ok(bundle_proposals)
+        };
+        let bundle_proposals = with_connection(&self.inner.db_connection.lock())?;
+        // Filter out proposals that have already been created
+        let res = bundle_proposals
+            .into_iter()
+            .map(Ok::<_, error::GetBundleProposals>)
+            .transpose_into_fallible()
+            .filter_map(|(sidechain_id, m6ids)| {
+                let pending_m6ids = self
+                    .inner
+                    .validator
+                    .get_pending_withdrawals(&sidechain_id)?;
+                let res: Vec<_> = m6ids
+                    .into_iter()
+                    .map(|(m6id, blinded_m6)| (m6id, blinded_m6, pending_m6ids.get(&m6id).copied()))
+                    .collect();
+                if res.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((sidechain_id, res)))
+                }
+            })
+            .collect()?;
+        Ok(res)
     }
 
     /// Fetches sidechain proposals from the validator. Returns proposals that
     /// are already included into a block, and possible to vote on.
-    async fn get_active_sidechain_proposals(
+    fn get_active_sidechain_proposals(
         &self,
-    ) -> Result<HashMap<SidechainNumber, SidechainProposal>> {
+    ) -> Result<HashMap<SidechainNumber, SidechainProposal>, crate::validator::GetSidechainsError>
+    {
         let pending_proposals = self
+            .inner
             .validator
             .get_sidechains()?
             .into_iter()
@@ -451,16 +784,13 @@ impl Wallet {
         &self,
         sidechain_number: SidechainNumber,
         data_hash: sha256d::Hash,
-    ) -> Result<()> {
+    ) -> Result<(), rusqlite::Error> {
         let sidechain_number: u8 = sidechain_number.into();
         let data_hash: &[u8; 32] = data_hash.as_byte_array();
-        self.db_connection
-            .lock()
-            .execute(
-                "INSERT INTO sidechain_acks (number, data_hash) VALUES (?1, ?2)",
-                (sidechain_number, data_hash),
-            )
-            .into_diagnostic()?;
+        self.inner.db_connection.lock().execute(
+            "INSERT INTO sidechain_acks (number, data_hash) VALUES (?1, ?2)",
+            (sidechain_number, data_hash),
+        )?;
         Ok(())
     }
 
@@ -489,14 +819,11 @@ impl Wallet {
         }
     }
 
-    fn delete_sidechain_ack(&self, ack: &SidechainAck) -> Result<()> {
-        self.db_connection
-            .lock()
-            .execute(
-                "DELETE FROM sidechain_acks WHERE number = ?1 AND data_hash = ?2",
-                (ack.sidechain_number.0, ack.description_hash.as_byte_array()),
-            )
-            .into_diagnostic()?;
+    fn delete_sidechain_ack(&self, ack: &SidechainAck) -> Result<(), rusqlite::Error> {
+        self.inner.db_connection.lock().execute(
+            "DELETE FROM sidechain_acks WHERE number = ?1 AND data_hash = ?2",
+            (ack.sidechain_number.0, ack.description_hash.as_byte_array()),
+        )?;
         Ok(())
     }
 
@@ -505,250 +832,38 @@ impl Wallet {
     fn get_bmm_requests(
         &self,
         prev_blockhash: &bitcoin::BlockHash,
-    ) -> Result<Vec<(SidechainNumber, [u8; 32])>> {
+    ) -> Result<Vec<(SidechainNumber, [u8; 32])>, rusqlite::Error> {
         // Satisfy clippy with a single function call per lock
         let with_connection = |connection: &Connection| -> Result<_, _> {
             let mut statement = connection
                 .prepare(
                     "SELECT sidechain_number, side_block_hash FROM bmm_requests WHERE prev_block_hash = ?"
-                )
-                .into_diagnostic()?;
+                )?;
 
             let queried = statement
                 .query_map([prev_blockhash.as_byte_array()], |row| {
                     let sidechain_number: u8 = row.get(0)?;
                     let side_blockhash: [u8; 32] = row.get(1)?;
                     Ok((SidechainNumber::from(sidechain_number), side_blockhash))
-                })
-                .into_diagnostic()?
-                .collect::<Result<_, _>>()
-                .into_diagnostic()?;
+                })?
+                .collect::<Result<_, _>>()?;
 
             Ok(queried)
         };
-        with_connection(&self.db_connection.lock())
-    }
-
-    // Gets wiped upon generating a new block.
-    // TODO: how will this work for non-regtest?
-    fn delete_pending_sidechain_proposals(&self) -> Result<()> {
-        self.db_connection
-            .lock()
-            .execute("DELETE FROM sidechain_proposals;", ())
-            .into_diagnostic()?;
-        Ok(())
-    }
-
-    fn delete_pending_deposits(&self) -> Result<()> {
-        self.db_connection
-            .lock()
-            .execute("DELETE FROM deposits;", ())
-            .into_diagnostic()?;
-        Ok(())
+        with_connection(&self.inner.db_connection.lock())
     }
 
     // Gets wiped upon generating a new block.
     // TODO: how will this work for non-regtest?
     fn delete_bmm_requests(&self, prev_blockhash: &bitcoin::BlockHash) -> Result<()> {
-        self.db_connection
+        self.inner
+            .db_connection
             .lock()
             .execute(
                 "DELETE FROM bmm_requests where prev_block_hash = ?;",
                 [prev_blockhash.as_byte_array()],
             )
             .into_diagnostic()?;
-        Ok(())
-    }
-
-    /// Fetches pending deposits. If `sidechain_number` is provided, only
-    /// deposits for that sidechain are returned.
-    fn get_pending_deposits(
-        &self,
-        sidechain_number: Option<SidechainNumber>,
-    ) -> Result<Vec<Deposit>> {
-        let with_connection = |connection: &Connection| -> Result<_> {
-            let mut statement = match sidechain_number {
-                Some(_sidechain_number) => connection
-                    .prepare(
-                        "SELECT sidechain_number, address, amount, tx_data
-                         FROM deposits INNER JOIN mempool ON deposits.txid = mempool.txid
-                         WHERE sidechain_number = ?1;",
-                    )
-                    .into_diagnostic()?,
-                None => connection
-                    .prepare(
-                        "SELECT sidechain_number, address, amount, tx_data
-                     FROM deposits INNER JOIN mempool ON deposits.txid = mempool.txid;",
-                    )
-                    .into_diagnostic()?,
-            };
-            // FIXME: Make this code more sane.
-            let func = |row: &Row| {
-                let sidechain_number: u8 = row.get(0)?;
-                let address: Vec<u8> = row.get(1)?;
-                let amount: u64 = row.get(2)?;
-                let tx_data: Vec<u8> = row.get(3)?;
-                let transaction =
-                    Transaction::consensus_decode_from_finite_reader(&mut tx_data.as_slice())
-                        .unwrap();
-                let deposit = Deposit {
-                    sidechain_number,
-                    address,
-                    amount,
-                    transaction,
-                };
-                Ok(deposit)
-            };
-
-            let rows = match sidechain_number {
-                Some(sidechain_number) => statement
-                    .query_map([u8::from(sidechain_number)], func)
-                    .into_diagnostic()?,
-                None => statement.query_map([], func).into_diagnostic()?,
-            };
-            let mut deposits = vec![];
-            for deposit in rows {
-                let deposit = deposit.into_diagnostic()?;
-                deposits.push(deposit);
-            }
-            Ok(deposits)
-        };
-        with_connection(&self.db_connection.lock())
-    }
-
-    async fn mine(&self, coinbase_outputs: &[TxOut], transactions: Vec<Transaction>) -> Result<()> {
-        let transaction_count = transactions.len();
-
-        let mut block = self.generate_block(coinbase_outputs, transactions).await?;
-        loop {
-            block.header.nonce += 1;
-            if block.header.validate_pow(block.header.target()).is_ok() {
-                break;
-            }
-        }
-        let mut block_bytes = vec![];
-        block
-            .consensus_encode(&mut block_bytes)
-            .map_err(error::EncodeBlock)?;
-
-        let () = self
-            .main_client
-            .submit_block(hex::encode(block_bytes))
-            .await
-            .map_err(|err| error::BitcoinCoreRPC {
-                method: "submitblock".to_string(),
-                error: err,
-            })?;
-
-        tracing::info!(
-            "Generate: submitted block with {} transactions: `{}`",
-            transaction_count,
-            block.header.block_hash()
-        );
-
-        std::thread::sleep(Duration::from_millis(500));
-        Ok(())
-    }
-
-    pub async fn generate(&self, count: u32, ack_all_proposals: bool) -> Result<()> {
-        tracing::info!("Generate: creating {} blocks", count);
-
-        for _ in 0..count {
-            // This is a list of pending sidechain proposals from /our/ wallet, fetched from
-            // the DB.
-            let sidechain_proposals = self.get_our_sidechain_proposals().into_diagnostic()?;
-            let mut coinbase_builder = CoinbaseBuilder::new();
-            for sidechain_proposal in sidechain_proposals {
-                coinbase_builder = coinbase_builder.propose_sidechain(sidechain_proposal);
-            }
-
-            let mut sidechain_acks = self.get_sidechain_acks()?;
-
-            // This is a map of pending sidechain proposals from the /validator/, i.e.
-            // proposals broadcasted by (potentially) someone else, and already active.
-            let active_sidechain_proposals = self.get_active_sidechain_proposals().await?;
-
-            if ack_all_proposals {
-                tracing::info!(
-                    "Handle sidechain ACK: acking all sidechains irregardless of what DB says"
-                );
-
-                let acks = sidechain_acks.clone();
-                for (sidechain_number, sidechain_proposal) in &active_sidechain_proposals {
-                    let sidechain_number = *sidechain_number;
-
-                    if !acks
-                        .iter()
-                        .any(|ack| ack.sidechain_number == sidechain_number)
-                    {
-                        tracing::debug!(
-                            "Handle sidechain ACK: adding 'fake' ACK for {}",
-                            sidechain_number
-                        );
-
-                        self.ack_sidechain(
-                            sidechain_number,
-                            sidechain_proposal.description.sha256d_hash(),
-                        )?;
-
-                        sidechain_acks.push(SidechainAck {
-                            sidechain_number,
-                            description_hash: sidechain_proposal.description.sha256d_hash(),
-                        });
-                    }
-                }
-            }
-
-            for sidechain_ack in sidechain_acks {
-                if !self.validate_sidechain_ack(&sidechain_ack, &active_sidechain_proposals) {
-                    self.delete_sidechain_ack(&sidechain_ack)?;
-                    tracing::info!(
-                        "Unable to handle sidechain ack, deleted: {}",
-                        sidechain_ack.sidechain_number
-                    );
-                    continue;
-                }
-
-                tracing::debug!(
-                    "Generate: adding ACK for sidechain {}",
-                    sidechain_ack.sidechain_number
-                );
-
-                coinbase_builder = coinbase_builder.ack_sidechain(
-                    sidechain_ack.sidechain_number,
-                    sidechain_ack.description_hash,
-                );
-            }
-
-            let mainchain_tip = self.validator.get_mainchain_tip()?;
-            let bmm_hashes = self.get_bmm_requests(&mainchain_tip)?;
-            for (sidechain_number, bmm_hash) in &bmm_hashes {
-                tracing::info!(
-                    "Generate: adding BMM accept for SC {} with hash: {}",
-                    sidechain_number,
-                    hex::encode(bmm_hash)
-                );
-                coinbase_builder = coinbase_builder.bmm_accept(*sidechain_number, bmm_hash);
-            }
-
-            let coinbase_outputs = coinbase_builder.build().into_diagnostic()?;
-            let deposits = self.get_pending_deposits(None)?;
-            let deposit_transactions: Vec<Transaction> = deposits
-                .into_iter()
-                .map(|deposit| deposit.transaction)
-                .collect();
-
-            tracing::info!(
-                "Generate: mining block with {} coinbase outputs, {} deposits",
-                coinbase_outputs.len(),
-                deposit_transactions.len()
-            );
-
-            self.mine(&coinbase_outputs, deposit_transactions).await?;
-            self.delete_pending_sidechain_proposals()?;
-            self.delete_pending_deposits()?;
-            self.delete_bmm_requests(&mainchain_tip)?;
-        }
         Ok(())
     }
 
@@ -768,28 +883,143 @@ impl Wallet {
         }
     }
 
-    async fn fetch_ctip_transaction(
-        &self,
-        ctip_txid: Txid,
-    ) -> Result<bdk_wallet::bitcoin::Transaction> {
+    fn create_op_return_output<Msg>(
+        msg: Msg,
+    ) -> Result<bdk_wallet::bitcoin::TxOut, <bitcoin::script::PushBytesBuf as TryFrom<Msg>>::Error>
+    where
+        PushBytesBuf: TryFrom<Msg>,
+    {
+        let op_return_txout = messages::create_op_return_output(msg)?;
+        Ok(bdk_wallet::bitcoin::TxOut {
+            script_pubkey: bdk_wallet::bitcoin::ScriptBuf::from_bytes(
+                op_return_txout.script_pubkey.to_bytes(),
+            ),
+            value: op_return_txout.value,
+        })
+    }
+
+    async fn fetch_transaction(&self, txid: Txid) -> Result<bdk_wallet::bitcoin::Transaction> {
         let block_hash = None;
 
-        let rpc_res = self
+        let transaction_hex = self
+            .inner
             .main_client
-            .get_raw_transaction(ctip_txid, GetRawTransactionVerbose::<true>, block_hash)
+            .get_raw_transaction(txid, GetRawTransactionVerbose::<false>, block_hash)
             .await
-            .into_diagnostic()?;
+            .map_err(|err| error::BitcoinCoreRPC {
+                method: "getrawtransaction".to_string(),
+                error: err,
+            })?;
 
-        let Some(transaction_hex) = rpc_res.as_str() else {
-            return Err(miette!("failed to fetch ctip transaction"));
-        };
-
-        let transaction_bytes = hex::decode(transaction_hex).unwrap();
         let transaction =
-            bitcoin::consensus::encode::deserialize::<Transaction>(&transaction_bytes)
+            bitcoin::consensus::encode::deserialize_hex::<Transaction>(&transaction_hex)
                 .into_diagnostic()?;
 
         convert::bitcoin_tx_to_bdk_tx(transaction).into_diagnostic()
+    }
+
+    /// [`bdk_wallet::TxOrdering`] for deposit txs
+    fn deposit_txordering(
+        sidechain_addrs: HashMap<Vec<u8>, SidechainNumber>,
+    ) -> bdk_wallet::TxOrdering {
+        use bitcoin::hashes::{Hash, Hmac, HmacEngine};
+        use std::cmp::Ordering;
+        let hmac_engine = || {
+            let key = {
+                use rand::RngCore;
+                let mut bytes = vec![0u8; <sha256::Hash as Hash>::Engine::BLOCK_SIZE];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                bytes
+            };
+            HmacEngine::<sha256::Hash>::new(&key)
+        };
+        fn hmac_sha256<T>(mut engine: HmacEngine<sha256::Hash>, value: &T) -> Hmac<sha256::Hash>
+        where
+            T: bitcoin::consensus::Encodable,
+        {
+            value
+                .consensus_encode(&mut engine)
+                .expect("should encode correctly");
+            Hmac::<sha256::Hash>::from_engine(engine)
+        }
+        let input_sort = {
+            let hmac_engine = hmac_engine();
+            move |txin_l: &bdk_wallet::bitcoin::TxIn, txin_r: &bdk_wallet::bitcoin::TxIn| {
+                let txin_l_hmac = hmac_sha256(hmac_engine.clone(), txin_l);
+                let txin_r_hmac = hmac_sha256(hmac_engine.clone(), txin_r);
+                txin_l_hmac.cmp(&txin_r_hmac)
+            }
+        };
+        enum TxOutKind {
+            OpDrivechain(SidechainNumber),
+            OpReturnAddress(SidechainNumber),
+            Other,
+        }
+        // classify as an op_drivechain output or an
+        // op_return address
+        fn classify_txout(
+            sidechain_addrs: &HashMap<Vec<u8>, SidechainNumber>,
+            txout: &bdk_wallet::bitcoin::TxOut,
+        ) -> TxOutKind {
+            if let Ok((_, sidechain_id)) =
+                crate::messages::parse_op_drivechain(txout.script_pubkey.as_bytes())
+            {
+                return TxOutKind::OpDrivechain(sidechain_id);
+            }
+            if let Some(address) =
+                crate::messages::try_parse_op_return_address(&txout.script_pubkey)
+            {
+                if let Some(sidechain_id) = sidechain_addrs.get(&address) {
+                    return TxOutKind::OpReturnAddress(*sidechain_id);
+                }
+            }
+            TxOutKind::Other
+        }
+        let output_sort = {
+            let hmac_engine = hmac_engine();
+            move |txout_l: &bdk_wallet::bitcoin::TxOut, txout_r: &bdk_wallet::bitcoin::TxOut| match (
+                classify_txout(&sidechain_addrs, txout_l),
+                classify_txout(&sidechain_addrs, txout_r),
+            ) {
+                (TxOutKind::OpDrivechain(_) | TxOutKind::OpReturnAddress(_), TxOutKind::Other) => {
+                    Ordering::Less
+                }
+                (TxOutKind::Other, TxOutKind::OpDrivechain(_) | TxOutKind::OpReturnAddress(_)) => {
+                    Ordering::Greater
+                }
+                (
+                    TxOutKind::OpDrivechain(sidechain_id_l),
+                    TxOutKind::OpDrivechain(sidechain_id_r),
+                )
+                | (
+                    TxOutKind::OpReturnAddress(sidechain_id_l),
+                    TxOutKind::OpReturnAddress(sidechain_id_r),
+                ) => sidechain_id_l.cmp(&sidechain_id_r),
+                (
+                    TxOutKind::OpDrivechain(sidechain_id_l),
+                    TxOutKind::OpReturnAddress(sidechain_id_r),
+                ) => match sidechain_id_l.cmp(&sidechain_id_r) {
+                    Ordering::Equal => Ordering::Less,
+                    ordering => ordering,
+                },
+                (
+                    TxOutKind::OpReturnAddress(sidechain_id_l),
+                    TxOutKind::OpDrivechain(sidechain_id_r),
+                ) => match sidechain_id_l.cmp(&sidechain_id_r) {
+                    Ordering::Equal => Ordering::Greater,
+                    ordering => ordering,
+                },
+                (TxOutKind::Other, TxOutKind::Other) => {
+                    let txout_l_hmac = hmac_sha256(hmac_engine.clone(), txout_l);
+                    let txout_r_hmac = hmac_sha256(hmac_engine.clone(), txout_r);
+                    txout_l_hmac.cmp(&txout_r_hmac)
+                }
+            }
+        };
+        bdk_wallet::TxOrdering::Custom {
+            input_sort: Arc::new(input_sort),
+            output_sort: Arc::new(output_sort),
+        }
     }
 
     #[allow(
@@ -803,6 +1033,12 @@ impl Wallet {
         sidechain_ctip: Option<&Ctip>,
         fee: Option<Amount>,
     ) -> Result<bdk_wallet::bitcoin::psbt::Psbt> {
+        let sidechain_number = match crate::messages::parse_op_drivechain(
+            op_drivechain_output.script_pubkey.as_bytes(),
+        ) {
+            Ok((_, sidechain_number)) => sidechain_number,
+            Err(_) => return Err(miette::miette!("Failed to parse sidechain number")),
+        };
         // If the sidechain has a Ctip (i.e. treasury UTXO), the BIP300 rules mandate that we spend the previous
         // Ctip.
         let ctip_foreign_utxo = match sidechain_ctip {
@@ -812,9 +1048,7 @@ impl Wallet {
                     vout: sidechain_ctip.outpoint.vout,
                 };
 
-                let ctip_transaction = self
-                    .fetch_ctip_transaction(sidechain_ctip.outpoint.txid)
-                    .await?;
+                let ctip_transaction = self.fetch_transaction(sidechain_ctip.outpoint.txid).await?;
 
                 let psbt_input = bdk_wallet::bitcoin::psbt::Input {
                     non_witness_utxo: Some(ctip_transaction),
@@ -827,8 +1061,8 @@ impl Wallet {
         };
 
         let psbt = {
-            let mut wallet = self.bitcoin_wallet.lock();
-            let mut builder = wallet.borrow_mut().build_tx();
+            let mut wallet_write = self.inner.write_wallet()?;
+            let mut builder = wallet_write.build_tx();
 
             builder
                 // important: the M5 OP_DRIVECHAIN output must come directly before the OP_RETURN sidechain address output.
@@ -851,6 +1085,15 @@ impl Wallet {
                     .into_diagnostic()?;
             }
 
+            builder.ordering(Self::deposit_txordering(
+                [(
+                    sidechain_address_data.as_bytes().to_owned(),
+                    sidechain_number,
+                )]
+                .into_iter()
+                .collect(),
+            ));
+
             builder.finish().into_diagnostic()?
         };
 
@@ -869,7 +1112,7 @@ impl Wallet {
         fee: Option<Amount>,
     ) -> Result<bitcoin::Txid> {
         // If this is None, there's been no deposit to this sidechain yet. We're the first one!
-        let sidechain_ctip = self.validator.try_get_ctip(sidechain_number)?;
+        let sidechain_ctip = self.inner.validator.try_get_ctip(sidechain_number)?;
         let sidechain_ctip = sidechain_ctip.as_ref();
 
         let sidechain_ctip_amount = sidechain_ctip
@@ -921,63 +1164,205 @@ impl Wallet {
         Ok(convert::bdk_txid_to_bitcoin_txid(txid))
     }
 
-    pub fn get_balance(&self) -> Result<()> {
-        if self.last_sync.read().is_none() {
+    pub async fn get_wallet_balance(&self) -> Result<bdk_wallet::Balance> {
+        if self.inner.last_sync.read().is_none() {
             return Err(miette!("get balance: wallet not synced"));
         }
 
-        let balance = self.bitcoin_wallet.lock().balance();
+        let balance = self.inner.read_wallet()?.balance();
 
-        tracing::trace!("Confirmed: {}", balance.confirmed);
-        tracing::trace!("Immature: {}", balance.immature);
-        tracing::trace!("Untrusted pending: {}", balance.untrusted_pending);
-        tracing::trace!("Trusted pending: {}", balance.trusted_pending);
-        Ok(())
-    }
-
-    pub fn sync(&self) -> Result<()> {
-        let start = SystemTime::now();
-        tracing::trace!("starting wallet sync");
-
-        let mut wallet_lock = self.bitcoin_wallet.lock();
-        let mut last_sync_write = self.last_sync.write();
-        let request = wallet_lock.start_sync_with_revealed_spks();
-
-        const BATCH_SIZE: usize = 5;
-        const FETCH_PREV_TXOUTS: bool = false;
-
-        let update = self
-            .bitcoin_blockchain
-            .sync(request, BATCH_SIZE, FETCH_PREV_TXOUTS)
-            .into_diagnostic()?;
-
-        wallet_lock.apply_update(update).into_diagnostic()?;
-
-        let mut database = self.bitcoin_db.lock();
-        wallet_lock.persist(&mut database).into_diagnostic()?;
-
-        tracing::debug!(
-            "wallet sync complete in {:?}",
-            start.elapsed().unwrap_or_default(),
-        );
-
-        *last_sync_write = Some(SystemTime::now());
-        drop(last_sync_write);
-        drop(wallet_lock);
-        Ok(())
+        Ok(balance)
     }
 
     #[allow(
         clippy::significant_drop_tightening,
         reason = "false positive for `bitcoin_wallet`"
     )]
+    pub async fn list_wallet_transactions(&self) -> Result<Vec<BDKWalletTransaction>> {
+        // Massage the wallet data into a format that we can use to calculate fees, etc.
+        let wallet_data = {
+            let wallet_read = self.inner.read_wallet()?;
+            let transactions = wallet_read.transactions();
+
+            transactions
+                .into_iter()
+                .map(|tx| {
+                    let txid = tx.tx_node.txid;
+                    let chain_position = tx.chain_position;
+                    let tx = tx.tx_node.tx.clone();
+
+                    let output_ownership: Vec<_> = tx
+                        .output
+                        .iter()
+                        .map(|output| {
+                            (
+                                output.value,
+                                wallet_read.is_mine(output.script_pubkey.clone()),
+                            )
+                        })
+                        .collect();
+
+                    // Just collect the inputs - we'll get their values using getrawtransaction later
+                    let inputs = tx.input.clone();
+
+                    (txid, chain_position, output_ownership, inputs)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Calculate fees, received, and sent amounts
+        let mut txs = Vec::new();
+        for (txid, chain_position, output_ownership, inputs) in wallet_data {
+            let mut input_value = Amount::ZERO;
+            let mut output_value = Amount::ZERO;
+            let mut received = Amount::ZERO;
+            let mut sent = Amount::ZERO;
+
+            // Calculate output value and received amount
+            for (value, is_mine) in output_ownership {
+                output_value += value;
+                if is_mine {
+                    received += value;
+                }
+            }
+
+            // Get input values using getrawtransaction
+            for input in inputs {
+                let transaction_hex = self
+                    .inner
+                    .main_client
+                    .get_raw_transaction(
+                        input.previous_output.txid,
+                        GetRawTransactionVerbose::<false>,
+                        None,
+                    )
+                    .await
+                    .map_err(|err| error::BitcoinCoreRPC {
+                        method: "getrawtransaction".to_string(),
+                        error: err,
+                    })?;
+
+                let prev_output =
+                    bitcoin::consensus::encode::deserialize_hex::<Transaction>(&transaction_hex)
+                        .into_diagnostic()?;
+
+                let value = prev_output.output[input.previous_output.vout as usize].value;
+                if self.inner.read_wallet()?.is_mine(
+                    prev_output.output[input.previous_output.vout as usize]
+                        .script_pubkey
+                        .clone(),
+                ) {
+                    sent += value;
+                }
+                input_value += value;
+            }
+
+            let fee = input_value - output_value;
+            // Calculate net wallet change (excluding fee)
+            // We need to handle received and sent separately since Amount can't be negative
+            let (final_received, final_sent) = if received >= sent {
+                (received - sent, Amount::from_sat(0)) // Net gain to wallet
+            } else {
+                (Amount::from_sat(0), sent - received - fee) // Net loss from wallet
+            };
+
+            txs.push(BDKWalletTransaction {
+                txid,
+                chain_position,
+                fee,
+                received: final_received,
+                sent: final_sent,
+            });
+        }
+        Ok(txs)
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "false positive for `bitcoin_wallet`"
+    )]
+    async fn create_send_psbt(
+        &self,
+        destinations: HashMap<bitcoin::Address, u64>,
+        fee_policy: Option<crate::types::FeePolicy>,
+        op_return_output: Option<bdk_wallet::bitcoin::TxOut>,
+    ) -> Result<bdk_wallet::bitcoin::psbt::Psbt> {
+        let psbt = {
+            let mut wallet_write = self.inner.write_wallet()?;
+            let mut builder = wallet_write.build_tx();
+
+            if let Some(op_return_output) = op_return_output {
+                builder.add_recipient(op_return_output.script_pubkey, op_return_output.value);
+            }
+
+            // Add outputs for each destination address
+            for (address, value) in destinations {
+                builder.add_recipient(address.script_pubkey(), Amount::from_sat(value));
+            }
+
+            match fee_policy {
+                Some(crate::types::FeePolicy::Absolute(fee)) => {
+                    builder.fee_absolute(fee);
+                }
+                Some(crate::types::FeePolicy::Rate(rate)) => {
+                    builder.fee_rate(rate);
+                }
+                None => (),
+            }
+
+            builder.finish().into_diagnostic()?
+        };
+
+        Ok(psbt)
+    }
+
+    /// Creates a transaction, sends it, and returns the TXID.
+    pub async fn send_wallet_transaction(
+        &self,
+        destinations: HashMap<bdk_wallet::bitcoin::Address, u64>,
+        fee_policy: Option<crate::types::FeePolicy>,
+        op_return_message: Option<Vec<u8>>,
+    ) -> Result<bitcoin::Txid> {
+        let op_return_output = op_return_message
+            .map(Self::create_op_return_output)
+            .transpose()
+            .into_diagnostic()?;
+
+        let psbt = self
+            .create_send_psbt(destinations, fee_policy, op_return_output)
+            .await?;
+
+        tracing::debug!("Created send PSBT: {psbt}",);
+
+        let tx = self.sign_transaction(psbt)?;
+        let txid = tx.compute_txid();
+
+        tracing::info!("Signed send transaction: `{txid}`",);
+
+        tracing::debug!("Serialized send transaction: {}", {
+            let tx_bytes = bdk_wallet::bitcoin::consensus::serialize(&tx);
+            hex::encode(tx_bytes)
+        });
+
+        self.broadcast_transaction(tx).await?;
+
+        tracing::info!("Broadcasted send transaction: `{txid}`",);
+
+        Ok(convert::bdk_txid_to_bitcoin_txid(txid))
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "false positive for `bitcoin_wallet`"
+    )]
+    #[allow(dead_code)]
     fn get_utxos(&self) -> Result<()> {
-        if self.last_sync.read().is_none() {
+        if self.inner.last_sync.read().is_none() {
             return Err(miette!("get utxos: wallet not synced"));
         }
 
-        let wallet_lock = self.bitcoin_wallet.lock();
-        let utxos = wallet_lock.list_unspent();
+        let wallet_read = self.inner.read_wallet()?;
+        let utxos = wallet_read.list_unspent();
         for utxo in utxos {
             tracing::trace!(
                 "address: {}, value: {}",
@@ -993,15 +1378,16 @@ impl Wallet {
     /// On signet: TBD, but needs some way of getting communicated to the miner.
     pub fn propose_sidechain(&self, proposal: &SidechainProposal) -> Result<(), rusqlite::Error> {
         let sidechain_number: u8 = proposal.sidechain_number.into();
-        self.db_connection.lock().execute(
-            "INSERT INTO sidechain_proposals (number, data) VALUES (?1, ?2)",
-            (sidechain_number, &proposal.description.0),
+        self.inner.db_connection.lock().execute(
+            "INSERT INTO sidechain_proposals (sidechain_number, data_hash, data) VALUES (?1, ?2, ?3)",
+            (sidechain_number, proposal.description.sha256d_hash().to_byte_array(), &proposal.description.0),
         )?;
         Ok(())
     }
 
     pub fn nack_sidechain(&self, sidechain_number: u8, data_hash: &[u8; 32]) -> Result<()> {
-        self.db_connection
+        self.inner
+            .db_connection
             .lock()
             .execute(
                 "DELETE FROM sidechain_acks WHERE number = ?1 AND data_hash = ?2",
@@ -1011,13 +1397,15 @@ impl Wallet {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn get_sidechain_ctip(
         &self,
         sidechain_number: SidechainNumber,
     ) -> Result<Option<(bitcoin::OutPoint, Amount, u64)>> {
-        let ctip = self.validator.try_get_ctip(sidechain_number)?;
+        let ctip = self.inner.validator.try_get_ctip(sidechain_number)?;
 
         let sequence_number = self
+            .inner
             .validator
             .get_ctip_sequence_number(sidechain_number)?
             .unwrap();
@@ -1031,7 +1419,7 @@ impl Wallet {
     }
 
     pub fn is_sidechain_active(&self, sidechain_number: SidechainNumber) -> Result<bool> {
-        let sidechains = self.validator.get_active_sidechains()?;
+        let sidechains = self.inner.validator.get_active_sidechains()?;
         let active = sidechains
             .iter()
             .any(|sc| sc.proposal.sidechain_number == sidechain_number);
@@ -1044,8 +1432,8 @@ impl Wallet {
         mut psbt: bdk_wallet::bitcoin::psbt::Psbt,
     ) -> Result<bdk_wallet::bitcoin::Transaction> {
         if !self
-            .bitcoin_wallet
-            .lock()
+            .inner
+            .read_wallet()?
             .sign(&mut psbt, bdk_wallet::signer::SignOptions::default())
             .into_diagnostic()?
         {
@@ -1063,7 +1451,7 @@ impl Wallet {
         sidechain_block_hash: [u8; 32],
     ) -> Result<bdk_wallet::bitcoin::ScriptBuf> {
         let message = [
-            &M8_BMM_REQUEST_TAG[..],
+            &M8BmmRequest::TAG[..],
             &[sidechain_number.into()],
             &sidechain_block_hash,
             &prev_mainchain_block_hash.to_byte_array(),
@@ -1094,8 +1482,8 @@ impl Wallet {
         )?;
 
         let psbt = {
-            let mut bitcoin_wallet = self.bitcoin_wallet.lock();
-            let mut builder = bitcoin_wallet.build_tx();
+            let mut wallet_write = self.inner.write_wallet()?;
+            let mut builder = wallet_write.build_tx();
             builder
                 .nlocktime(locktime)
                 .add_recipient(message, bid_amount);
@@ -1133,7 +1521,7 @@ impl Wallet {
                     |_| Ok(true)
                 )
         };
-        with_connection(&self.db_connection.lock()).into_diagnostic()
+        with_connection(&self.inner.db_connection.lock()).into_diagnostic()
     }
 
     /// Creates a BMM request transaction. Does NOT broadcast.
@@ -1189,6 +1577,7 @@ impl Wallet {
 
         const MAX_BURN_AMOUNT: f64 = 21_000_000.0;
         let broadcast_result = self
+            .inner
             .main_client
             .send_raw_transaction(encoded_tx, None, Some(MAX_BURN_AMOUNT))
             .await
@@ -1205,22 +1594,48 @@ impl Wallet {
         // Using next_unused_address here means that we get a new address
         // when funds are received. Without this we'd need to take care not
         // to cross the wallet scan gap.
-        let mut wallet = self.bitcoin_wallet.lock();
-        let info = wallet
-            .borrow_mut()
-            .next_unused_address(bdk_wallet::KeychainKind::External);
+        let mut wallet_write = self
+            .inner
+            .write_wallet()
+            .map_err(|err| Report::wrap_err(err.into(), "get new address"))?;
 
-        let mut bitcoin_db = self.bitcoin_db.lock();
+        let info = wallet_write.next_unused_address(bdk_wallet::KeychainKind::External);
+
+        let mut bitcoin_db = self.inner.bitcoin_db.lock();
         let bitcoin_db = bitcoin_db.borrow_mut();
-        wallet.persist(bitcoin_db).into_diagnostic()?;
+        wallet_write.persist(bitcoin_db).into_diagnostic()?;
         Ok(info.address)
     }
+
+    pub fn put_withdrawal_bundle(
+        &self,
+        sidechain_number: SidechainNumber,
+        blinded_m6: &BlindedM6,
+    ) -> Result<M6id> {
+        let m6id = blinded_m6.compute_m6id();
+        let tx_bytes = bitcoin::consensus::serialize(blinded_m6.as_ref());
+        self.inner.db_connection
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO bundle_proposals (sidechain_number, bundle_hash, bundle_tx) VALUES (?1, ?2, ?3)",
+                (sidechain_number.0, m6id.0.as_byte_array(), tx_bytes),
+            )
+            .into_diagnostic()?;
+        Ok(m6id)
+    }
+
+    pub fn unlock_existing_wallet(&self, password: &str) -> Result<(), miette::Report> {
+        self.inner.unlock_existing_wallet(password)
+    }
+
+    // Creates a new wallet with a given mnemonic and encryption password.
+    // Note that the password is NOT a BIP39 passphrase, but is only used to
+    // encrypt the mnemonic in storage.
+    pub fn create_wallet(
+        &self,
+        mnemonic: Option<Mnemonic>,
+        password: Option<&str>,
+    ) -> Result<(), miette::Report> {
+        self.inner.create_new_wallet(mnemonic, password)
+    }
 }
-
-type PendingTransactions = (
-    SidechainNumber,
-    Vec<(u64, cusf_sidechain_types::OutPoint, u64)>,
-    Vec<cusf_sidechain_types::Output>,
-);
-
-type SidechainUTXOs = BTreeMap<u64, (cusf_sidechain_types::OutPoint, u32, u64, Option<u64>)>;

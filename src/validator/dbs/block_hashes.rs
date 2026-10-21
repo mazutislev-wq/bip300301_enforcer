@@ -3,10 +3,7 @@ use fallible_iterator::FallibleIterator;
 use heed::{types::SerdeBincode, RoTxn};
 
 use crate::{
-    types::{
-        BlockInfo, BmmCommitments, Deposit, HeaderInfo, SidechainProposal, TwoWayPegData,
-        WithdrawalBundleEvent,
-    },
+    types::{BlockEvent, BlockInfo, BmmCommitments, HeaderInfo, TwoWayPegData},
     validator::dbs::util::{db_error, CreateDbError, Database, Env, RwTxn},
 };
 
@@ -32,7 +29,7 @@ pub mod error {
     }
 
     #[derive(Debug, Error)]
-    pub(crate) enum PutBlockInfo {
+    pub(in crate::validator::dbs::block_hashes) enum PutBlockInfoInner {
         #[error(transparent)]
         DbPut(#[from] db_error::Put),
         #[error(transparent)]
@@ -41,6 +38,19 @@ pub mod error {
         MissingHeader(#[from] MissingHeader),
         #[error(transparent)]
         MissingParent(#[from] MissingParent),
+    }
+
+    #[derive(Debug, Error)]
+    #[error("Error storing block info")]
+    pub(crate) struct PutBlockInfo(#[source] PutBlockInfoInner);
+
+    impl<Err> From<Err> for PutBlockInfo
+    where
+        PutBlockInfoInner: From<Err>,
+    {
+        fn from(err: Err) -> Self {
+            Self(err.into())
+        }
     }
 
     #[derive(Debug, Error)]
@@ -84,7 +94,7 @@ pub mod error {
     }
 
     #[derive(Debug, Error)]
-    pub enum GetTwoWayPegDataRange {
+    pub(crate) enum GetTwoWayPegDataRange {
         #[error("End block `{end_block}` not found")]
         EndBlockNotFound { end_block: BlockHash },
         #[error("Previous block `{prev_block}` not found for block `{block}`")]
@@ -119,45 +129,31 @@ pub struct BlockHashDbs {
     cumulative_work: Database<SerdeBincode<BlockHash>, SerdeBincode<Work>>,
     // All ancestors for each block MUST exist in this DB.
     // All keys in this DB MUST also exist in ALL other DBs.
-    deposits: Database<SerdeBincode<BlockHash>, SerdeBincode<Vec<Deposit>>>,
+    events: Database<SerdeBincode<BlockHash>, SerdeBincode<Vec<BlockEvent>>>,
     // All keys in this DB MUST also exist in `height`
     header: Database<SerdeBincode<BlockHash>, SerdeBincode<Header>>,
     // All keys in this DB MUST also exist in `header` as keys AND/OR
     // `prev_blockhash` in a value
     height: Database<SerdeBincode<BlockHash>, SerdeBincode<u32>>,
-    /// Sidechain proposals in each block sorted by coinbase vout
-    // All ancestors for each block MUST exist in this DB.
-    // All keys in this DB MUST also exist in ALL other DBs.
-    sidechain_proposals:
-        Database<SerdeBincode<BlockHash>, SerdeBincode<Vec<(u32, SidechainProposal)>>>,
-    // All ancestors for each block MUST exist in this DB.
-    // All keys in this DB MUST also exist in ALL other DBs.
-    withdrawal_bundle_events:
-        Database<SerdeBincode<BlockHash>, SerdeBincode<Vec<WithdrawalBundleEvent>>>,
 }
 
 impl BlockHashDbs {
-    pub const NUM_DBS: u32 = 8;
+    pub const NUM_DBS: u32 = 6;
 
     pub(super) fn new(env: &Env, rwtxn: &mut RwTxn) -> Result<Self, CreateDbError> {
         let bmm_commitments = env.create_db(rwtxn, "block_hash_to_bmm_commitments")?;
         let coinbase_txid = env.create_db(rwtxn, "block_hash_to_coinbase_txid")?;
         let cumulative_work = env.create_db(rwtxn, "block_hash_to_cumulative_work")?;
-        let deposits = env.create_db(rwtxn, "block_hash_to_deposits")?;
+        let events = env.create_db(rwtxn, "block_hash_to_events")?;
         let header = env.create_db(rwtxn, "block_hash_to_header")?;
         let height = env.create_db(rwtxn, "block_hash_to_height")?;
-        let sidechain_proposals = env.create_db(rwtxn, "block_hash_to_sidechain_proposals")?;
-        let withdrawal_bundle_events =
-            env.create_db(rwtxn, "block_hash_to_withdrawal_bundle_events")?;
         Ok(Self {
             bmm_commitments,
             coinbase_txid,
             cumulative_work,
-            deposits,
+            events,
             header,
             height,
-            sidechain_proposals,
-            withdrawal_bundle_events,
         })
     }
 
@@ -222,7 +218,7 @@ impl BlockHashDbs {
             let err = error::MissingHeader {
                 block_hash: *block_hash,
             };
-            return Err(error::PutBlockInfo::MissingHeader(err));
+            return Err(error::PutBlockInfoInner::MissingHeader(err).into());
         };
         let cumulative_work = if header.prev_blockhash == BlockHash::all_zeros() {
             header.work()
@@ -236,7 +232,7 @@ impl BlockHashDbs {
                 block_hash: *block_hash,
                 prev_block_hash: header.prev_blockhash,
             };
-            return Err(error::PutBlockInfo::MissingParent(err));
+            return Err(error::PutBlockInfoInner::MissingParent(err).into());
         };
         let () = self
             .bmm_commitments
@@ -247,15 +243,7 @@ impl BlockHashDbs {
         let () = self
             .cumulative_work
             .put(rwtxn, block_hash, &cumulative_work)?;
-        let () = self.deposits.put(rwtxn, block_hash, &block_info.deposits)?;
-        let () =
-            self.sidechain_proposals
-                .put(rwtxn, block_hash, &block_info.sidechain_proposals)?;
-        let () = self.withdrawal_bundle_events.put(
-            rwtxn,
-            block_hash,
-            &block_info.withdrawal_bundle_events,
-        )?;
+        let () = self.events.put(rwtxn, block_hash, &block_info.events)?;
         Ok(())
     }
 
@@ -350,35 +338,15 @@ impl BlockHashDbs {
             );
             return Err(error::TryGetBlockInfo::InconsistentDbs(err));
         };
-        let Some(deposits) = self.deposits.try_get(rotxn, block_hash)? else {
+        let Some(events) = self.events.try_get(rotxn, block_hash)? else {
             let err =
-                db_error::InconsistentDbs::new(block_hash, &self.bmm_commitments, &self.deposits);
-            return Err(error::TryGetBlockInfo::InconsistentDbs(err));
-        };
-        let Some(sidechain_proposals) = self.sidechain_proposals.try_get(rotxn, block_hash)? else {
-            let err = db_error::InconsistentDbs::new(
-                block_hash,
-                &self.bmm_commitments,
-                &self.sidechain_proposals,
-            );
-            return Err(error::TryGetBlockInfo::InconsistentDbs(err));
-        };
-        let Some(withdrawal_bundle_events) =
-            self.withdrawal_bundle_events.try_get(rotxn, block_hash)?
-        else {
-            let err = db_error::InconsistentDbs::new(
-                block_hash,
-                &self.bmm_commitments,
-                &self.withdrawal_bundle_events,
-            );
+                db_error::InconsistentDbs::new(block_hash, &self.bmm_commitments, &self.events);
             return Err(error::TryGetBlockInfo::InconsistentDbs(err));
         };
         let block_info = BlockInfo {
             bmm_commitments,
             coinbase_txid,
-            deposits,
-            sidechain_proposals,
-            withdrawal_bundle_events,
+            events,
         };
         Ok(Some(block_info))
     }
@@ -454,7 +422,7 @@ impl BlockHashDbs {
                 });
             };
             prev_block = current_block;
-            current_block = two_way_peg_data.header_info.block_hash;
+            current_block = two_way_peg_data.header_info.prev_block_hash;
             res.push(two_way_peg_data);
         }
         res.reverse();

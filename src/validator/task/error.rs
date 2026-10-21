@@ -1,14 +1,16 @@
 use bip300301::jsonrpsee;
+use bitcoin::hashes::sha256d;
 use fatality::fatality;
 use thiserror::Error;
 
 use crate::{
+    messages::CoinbaseMessagesError,
     types::SidechainNumber,
     validator::dbs::{self, db_error},
 };
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM1ProposeSidechain {
+pub(in crate::validator) enum HandleM1ProposeSidechain {
     #[error(transparent)]
     #[fatal]
     DbPut(#[from] db_error::Put),
@@ -19,7 +21,7 @@ pub(in crate::validator::task) enum HandleM1ProposeSidechain {
 
 #[allow(clippy::enum_variant_names)]
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM2AckSidechain {
+pub(in crate::validator) enum HandleM2AckSidechain {
     #[error(transparent)]
     #[fatal]
     DbDelete(#[from] db_error::Delete),
@@ -29,11 +31,19 @@ pub(in crate::validator::task) enum HandleM2AckSidechain {
     #[error(transparent)]
     #[fatal]
     DbTryGet(#[from] db_error::TryGet),
+    #[error(transparent)]
+    #[fatal]
+    PutActiveSidechain(#[from] dbs::PutActiveSidechainError),
+    #[error("Missing sidechain proposal for slot `{sidechain_slot}`: `{description_hash}`")]
+    MissingProposal {
+        sidechain_slot: SidechainNumber,
+        description_hash: sha256d::Hash,
+    },
 }
 
 #[allow(clippy::enum_variant_names)]
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleFailedSidechainProposals {
+pub(in crate::validator) enum HandleFailedSidechainProposals {
     #[error(transparent)]
     #[fatal]
     DbDelete(#[from] db_error::Delete),
@@ -46,13 +56,10 @@ pub(in crate::validator::task) enum HandleFailedSidechainProposals {
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM3ProposeBundle {
+pub(in crate::validator) enum HandleM3ProposeBundle {
     #[error(transparent)]
     #[fatal]
-    DbPut(#[from] db_error::Put),
-    #[error(transparent)]
-    #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    TryPutPendingM6id(#[from] dbs::TryWithPendingWithdrawalsError),
     #[error(
         "Cannot propose bundle; sidechain slot {} is inactive",
         .sidechain_number.0
@@ -61,34 +68,44 @@ pub(in crate::validator::task) enum HandleM3ProposeBundle {
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM4Votes {
+pub(in crate::validator) enum HandleM4Votes {
+    #[error(transparent)]
+    DbIter(#[from] db_error::Iter),
+    #[error("Invalid votes: expected {expected}, but found {len}")]
+    InvalidVotes { expected: usize, len: usize },
+    #[error(
+        "No pending withdrawal for sidechain `{}` at index `{}`",
+        .sidechain_number,
+        .index
+    )]
+    UpvoteFailed {
+        sidechain_number: SidechainNumber,
+        index: u16,
+    },
     #[error(transparent)]
     #[fatal]
-    DbPut(#[from] db_error::Put),
+    TryAlarmPendingM6ids(dbs::TryWithPendingWithdrawalsError),
     #[error(transparent)]
     #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    TryUpvotePendingM6id(#[from] dbs::TryUpvotePendingWithdrawalError),
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM4AckBundles {
+pub(in crate::validator) enum HandleM4AckBundles {
     #[error("Error handling M4 Votes")]
     #[fatal(forward)]
     Votes(#[from] HandleM4Votes),
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleFailedM6Ids {
+pub(in crate::validator) enum HandleFailedM6Ids {
     #[error(transparent)]
     #[fatal]
-    DbIter(#[from] db_error::Iter),
-    #[error(transparent)]
-    #[fatal]
-    DbPut(#[from] db_error::Put),
+    RetainPendingWithdrawals(#[from] dbs::RetainPendingWithdrawalsError),
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM5M6 {
+pub(in crate::validator) enum HandleM5M6 {
     #[error(transparent)]
     #[fatal]
     DbPut(#[from] db_error::Put),
@@ -97,12 +114,17 @@ pub(in crate::validator::task) enum HandleM5M6 {
     DbTryGet(#[from] db_error::TryGet),
     #[error("Invalid M6")]
     InvalidM6,
+    #[error(transparent)]
+    M6id(#[from] crate::messages::M6idError),
     #[error("Old Ctip for sidechain {} is unspent", .sidechain_number.0)]
     OldCtipUnspent { sidechain_number: SidechainNumber },
+    #[error(transparent)]
+    #[fatal]
+    TryWithPendingWithdrawals(#[from] dbs::TryWithPendingWithdrawalsError),
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum HandleM8 {
+pub(in crate::validator) enum HandleM8 {
     #[error("BMM request expired")]
     BmmRequestExpired,
     #[error("Cannot include BMM request; not accepted by miners")]
@@ -110,7 +132,50 @@ pub(in crate::validator::task) enum HandleM8 {
 }
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum ConnectBlock {
+pub(in crate::validator) enum HandleTransaction {
+    #[error("Error handling M5/M6")]
+    #[fatal(forward)]
+    M5M6(#[from] HandleM5M6),
+    #[error("Error handling M8")]
+    #[fatal(forward)]
+    M8(#[from] HandleM8),
+}
+
+#[derive(Debug, Error)]
+pub(in crate::validator::task) enum ValidateTransactionInner {
+    #[error(transparent)]
+    DbTryGet(#[from] db_error::TryGet),
+    #[error("No chain tip")]
+    NoChainTip,
+    #[error(transparent)]
+    Transaction(#[from] <HandleTransaction as fatality::Split>::Fatal),
+    #[error(transparent)]
+    WriteTxn(#[from] dbs::WriteTxnError),
+}
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+#[repr(transparent)]
+pub struct ValidateTransaction(ValidateTransactionInner);
+
+impl<Err> From<Err> for ValidateTransaction
+where
+    ValidateTransactionInner: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self(err.into())
+    }
+}
+
+#[fatality(splitable)]
+pub(in crate::validator) enum ConnectBlock {
+    #[error("Block parent `{parent}` does not match tip `{tip}`")]
+    BlockParent {
+        parent: bitcoin::BlockHash,
+        tip: bitcoin::BlockHash,
+    },
+    #[error(transparent)]
+    CoinbaseMessages(#[from] CoinbaseMessagesError),
     #[error(transparent)]
     #[fatal]
     PutBlockInfo(#[from] dbs::block_hash_dbs_error::PutBlockInfo),
@@ -150,24 +215,21 @@ pub(in crate::validator::task) enum ConnectBlock {
     #[error("Error handling M4 (ack bundles)")]
     #[fatal(forward)]
     M4AckBundles(#[from] HandleM4AckBundles),
-    #[error("Error handling M5/M6")]
-    #[fatal(forward)]
-    M5M6(#[from] HandleM5M6),
-    #[error("Error handling M8")]
-    #[fatal(forward)]
-    M8(#[from] HandleM8),
     #[error("Multiple blocks BMM'd in sidechain slot {}", .sidechain_number.0)]
     MultipleBmmBlocks { sidechain_number: SidechainNumber },
+    #[error(transparent)]
+    #[fatal(forward)]
+    Transaction(#[from] HandleTransaction),
 }
 
 #[derive(Debug, Error)]
-pub(in crate::validator::task) enum DisconnectBlock {}
+pub(in crate::validator) enum DisconnectBlock {}
 
 #[derive(Debug, Error)]
 pub(in crate::validator::task) enum TxValidation {}
 
 #[fatality(splitable)]
-pub(in crate::validator::task) enum Sync {
+pub(in crate::validator) enum Sync {
     #[error(transparent)]
     #[fatal]
     CommitWriteTxn(#[from] dbs::CommitWriteTxnError),
@@ -208,7 +270,7 @@ pub(in crate::validator::task) enum FatalInner {
     #[error(transparent)]
     Zmq(#[from] zeromq::ZmqError),
     #[error(transparent)]
-    ZmqSequenceStream(#[from] crate::zmq::SequenceStreamError),
+    ZmqSequenceStream(#[from] cusf_enforcer_mempool::zmq::SequenceStreamError),
 }
 
 #[derive(Debug, Error)]

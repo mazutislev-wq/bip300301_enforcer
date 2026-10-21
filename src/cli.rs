@@ -93,9 +93,16 @@ pub struct WalletConfig {
     /// Signet: 50001, regtest: 60401
     #[arg(long = "wallet-electrum-port")]
     pub electrum_port: Option<u16>,
+
+    /// If no existing wallet is found, automatically create and load
+    /// a new, unencrypted wallet from a randomly generated BIP39 mnemonic.
+    #[arg(long = "wallet-auto-create", default_value_t = false)]
+    pub auto_create: bool,
 }
 
 const DEFAULT_SERVE_RPC_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8122));
+const DEFAULT_SERVE_GRPC_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50_051));
 
 #[derive(Clone, Parser)]
@@ -103,8 +110,12 @@ pub struct Config {
     /// Directory to store wallet + drivechain + validator data.
     #[arg(default_value_os_t = get_data_dir().unwrap_or_else(|_| PathBuf::from("./datadir")), long)]
     pub data_dir: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     pub enable_wallet: bool,
+    /// If enabled, maintains a mempool. If the wallet is enabled, serves
+    /// getblocktemplate.
+    #[arg(long, default_value_t = false)]
+    pub enable_mempool: bool,
     /// Log level.
     /// Logs from most dependencies are filtered one level below the specified
     /// log level, if a lower level exists.
@@ -117,8 +128,12 @@ pub struct Config {
     /// Bitcoin node ZMQ endpoint for `sequence`
     #[arg(long)]
     pub node_zmq_addr_sequence: String,
+    /// Serve RPCs such as `getblocktemplate` on this address
     #[arg(default_value_t = DEFAULT_SERVE_RPC_ADDR, long)]
     pub serve_rpc_addr: SocketAddr,
+    /// Serve gRPCs on this address
+    #[arg(default_value_t = DEFAULT_SERVE_GRPC_ADDR, long)]
+    pub serve_grpc_addr: SocketAddr,
     #[command(flatten)]
     pub wallet_opts: WalletConfig,
 }

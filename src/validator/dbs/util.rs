@@ -48,7 +48,11 @@ pub struct RwTxn<'a> {
     db_dir: &'a Path,
 }
 
-impl<'rwtxn> RwTxn<'rwtxn> {
+impl RwTxn<'_> {
+    pub fn abort(self) {
+        self.inner.abort()
+    }
+
     pub fn commit(self) -> Result<(), CommitWriteTxnError> {
         self.inner.commit().map_err(|err| CommitWriteTxnError {
             db_dir: self.db_dir.to_owned(),
@@ -64,7 +68,7 @@ impl<'rwtxn> std::ops::Deref for RwTxn<'rwtxn> {
     }
 }
 
-impl<'rwtxn> std::ops::DerefMut for RwTxn<'rwtxn> {
+impl std::ops::DerefMut for RwTxn<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
@@ -272,7 +276,7 @@ impl<KC, DC> RoDatabase<KC, DC> {
         }
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, dead_code)]
     pub fn first<'txn>(
         &self,
         rotxn: &'txn RoTxn<'_>,
@@ -288,14 +292,11 @@ impl<KC, DC> RoDatabase<KC, DC> {
         })
     }
 
-    pub fn iter<'txn>(
-        &self,
-        rotxn: &'txn RoTxn<'_>,
+    pub fn iter<'a, 'txn>(
+        &'a self,
+        rotxn: &'txn RoTxn<'a>,
     ) -> Result<
-        fallible_iterator::MapErr<
-            fallible_iterator::Convert<heed::RoIter<'txn, KC, DC>>,
-            impl FnMut(heed::Error) -> db_error::IterItem + '_,
-        >,
+        impl FallibleIterator<Item = (KC::DItem, DC::DItem), Error = db_error::IterItem> + 'txn,
         db_error::IterInit,
     >
     where
@@ -306,7 +307,7 @@ impl<KC, DC> RoDatabase<KC, DC> {
             Ok(it) => Ok(it.transpose_into_fallible().map_err({
                 let db_path = self.path.clone();
                 move |err| db_error::IterItem {
-                    db_name: self.name,
+                    db_name: self.name(),
                     db_path: (*db_path).clone(),
                     source: err,
                 }
@@ -475,6 +476,13 @@ pub struct ReadTxnError {
 }
 
 #[derive(Debug, Error)]
+#[error("Error creating nested write txn for database dir `{db_dir}`")]
+pub struct NestedWriteTxnError {
+    db_dir: PathBuf,
+    source: heed::Error,
+}
+
+#[derive(Debug, Error)]
 #[error("Error creating write txn for database dir `{db_dir}`")]
 pub struct WriteTxnError {
     db_dir: PathBuf,
@@ -530,6 +538,23 @@ impl Env {
         self.inner.read_txn().map_err(|err| ReadTxnError {
             db_dir: (*self.path).clone(),
             source: err,
+        })
+    }
+
+    pub fn nested_write_txn<'p>(
+        &'p self,
+        parent: &'p mut RwTxn<'_>,
+    ) -> Result<RwTxn<'p>, NestedWriteTxnError> {
+        let inner = self
+            .inner
+            .nested_write_txn(&mut parent.inner)
+            .map_err(|err| NestedWriteTxnError {
+                db_dir: (*self.path).clone(),
+                source: err,
+            })?;
+        Ok(RwTxn {
+            inner,
+            db_dir: &self.path,
         })
     }
 
